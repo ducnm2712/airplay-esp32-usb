@@ -37,6 +37,7 @@ CONFIGS=(
   "louder-esp32-s3-mini|esp32s3|config/sdkconfig.defaults;config/sdkconfig.defaults.louder-esp32-s3-mini|"
   "amped-esparagus-plus-s3|esp32s3|config/sdkconfig.defaults;config/sdkconfig.defaults.amped-esparagus-plus-s3|"
   "software-eq|esp32s3|config/sdkconfig.defaults;config/sdkconfig.defaults.esp32s3;config/sdkconfig.defaults.uac;config/sdkconfig.defaults.software-eq|"
+  "esp32s3-usbhost|esp32s3|config/sdkconfig.defaults;config/sdkconfig.defaults.esp32s3;config/sdkconfig.defaults.esp32s3-usbhost|"
 )
 
 FIX=""
