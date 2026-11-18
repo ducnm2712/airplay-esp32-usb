@@ -447,7 +447,7 @@ static bool find_speaker_altsetting(const usb_config_desc_t *cfg) {
         uint16_t ttype = (uint16_t)(p[4] | (p[5] << 8));
         if ((ttype >> 8) != 0x01) {
           s_speaker_src = p[7];
-        }else {
+        } else {
           s_mic_fu = p[7];
         }
       } else if (p[2] == 0x04 && len >= 5) {
@@ -1656,9 +1656,9 @@ uint32_t audio_output_get_hardware_latency_us(void) {
    * those pulled-ahead frames as "early" and emits silence, the receive buffer
    * backs up and ages, and stale frames then drop as "late" — the oscillation
    * heard as stutter. Reporting the true depth makes them release on time. */
-  uint32_t fifo_us =
-      (uint32_t)((uint64_t)FIFO_TARGET_BYTES * 1000000ULL /
-                  ((uint64_t)s_out_rate * (uint64_t)s_frame_bytes));
+  uint32_t fifo_us =(uint32_t)(
+      (uint64_t)FIFO_TARGET_BYTES * 1000000ULL /
+      ((uint64_t)s_out_rate * (uint64_t)s_frame_bytes));
   uint32_t urb_us = (uint32_t)NUM_URBS * PACKETS_PER_URB * 1000;
   return fifo_us + urb_us;
 }
