@@ -1656,9 +1656,9 @@ uint32_t audio_output_get_hardware_latency_us(void) {
    * those pulled-ahead frames as "early" and emits silence, the receive buffer
    * backs up and ages, and stale frames then drop as "late" — the oscillation
    * heard as stutter. Reporting the true depth makes them release on time. */
-  uint32_t fifo_us = (uint32_t)(((uint64_t)FIFO_TARGET_BYTES * 1000000ULL) /
-                              ((uint64_t)s_out_rate *
-                               (uint64_t)s_frame_bytes));
+  uint32_t fifo_us =
+    (uint32_t)((uint64_t)FIFO_TARGET_BYTES * 1000000ULL /
+               ((uint64_t)s_out_rate * (uint64_t)s_frame_bytes));
   uint32_t urb_us = (uint32_t)NUM_URBS * PACKETS_PER_URB * 1000;
   return fifo_us + urb_us;
 }
