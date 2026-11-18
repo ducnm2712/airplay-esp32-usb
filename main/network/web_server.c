@@ -1,11 +1,17 @@
+// SPDX-FileCopyrightText: 2026 airplay-esp32 contributors
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 #include "web_server.h"
 
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_http_server.h"
 #include "esp_system.h"
 #include "cJSON.h"
 #include <stdio.h>
+#include <ctype.h>
 #include <string.h>
+#include <strings.h>
 #include <stdlib.h>
 #include <math.h>
 #include <sys/stat.h>
@@ -21,15 +27,38 @@
 #include "ota.h"
 #include "log_stream.h"
 #include "rtsp_server.h"
-#include "rtsp_events.h"
+#include "playback_events.h"
+#include "audio_delay.h"
 #include "audio_output.h"
 #include "esp_app_desc.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
+#ifdef CONFIG_SENDSPIN_ENABLE
+#include "sendspin.h"
+#endif
+
 #ifdef CONFIG_DAC_TAS58XX
 #include "dac_tas58xx.h"
+#endif
+
+#ifdef CONFIG_SOFTWARE_EQ
+#include "audio_eq.h"
+#endif
+
+#ifdef CONFIG_SOFTWARE_EQ_AB
+#include "eq_ab.h"
+#endif
+
+/* The /bq page and API run on the TAS58xx DSP or, for plain DACs, in
+ * software. */
+#if defined(CONFIG_DAC_TAS58XX) || defined(CONFIG_SOFTWARE_EQ)
+#define HAS_BQ_API 1
+#endif
+
+#ifdef CONFIG_HUSB238A
+#include "husb238a.h"
 #endif
 
 #ifdef CONFIG_DAC_TAS57XX
@@ -57,48 +86,202 @@
 static const char *TAG = "web_server";
 static httpd_handle_t s_server = NULL;
 
+/* ------------------------------------------------------------------ */
+/* Cross-site request guard                                            */
+/* ------------------------------------------------------------------ */
+
+/* The API has no login, so a page on any other site that a browser on the
+ * LAN opens could otherwise use it: a cross-site POST of a plain-text body
+ * needs no preflight, so it would reach the handler, which takes any body.
+ * A browser marks such a request with an Origin that is not this device's.
+ * The other route is DNS rebinding, where the other site points its own name
+ * at this device and the browser treats the device as that site, so the
+ * Origin matches; the Host then carries the other site's name. So the API
+ * refuses a request whose Host is a name a public domain could hold, and one
+ * whose Origin is not http://<Host>. A request with no Origin (curl, scripts,
+ * Music Assistant) passes, so neither needs to change. */
+
+// Suffixes home networks and their routers use; .fritz.box is AVM's, which
+// AVM holds so that nobody else can.
+static const char *const LOCAL_SUFFIXES[] = {
+    ".local",    ".lan",         ".home",      ".home.arpa",
+    ".internal", ".localdomain", ".fritz.box",
+};
+
+// Longer Host or Origin values are refused rather than truncated.
+#define GUARD_HDR_MAX 128
+
+static bool host_is_local(const char *host) {
+  size_t len = strlen(host);
+  if (host[0] == '[') {
+    return true; // IPv6 literal
+  }
+  const char *colon = strrchr(host, ':');
+  if (colon) {
+    len = (size_t)(colon - host);
+  }
+  if (len > 0 && host[len - 1] == '.') {
+    len--; // fully qualified form
+  }
+  if (len == 0) {
+    return false;
+  }
+
+  bool has_dot = false;
+  bool ipv4 = true;
+  for (size_t i = 0; i < len; i++) {
+    if (host[i] == '.') {
+      has_dot = true;
+    } else if (!isdigit((unsigned char)host[i])) {
+      ipv4 = false;
+    }
+  }
+  if (ipv4 || !has_dot) {
+    return true; // address, or a single-label name
+  }
+  for (size_t i = 0; i < sizeof(LOCAL_SUFFIXES) / sizeof(LOCAL_SUFFIXES[0]);
+       i++) {
+    size_t n = strlen(LOCAL_SUFFIXES[i]);
+    if (len > n && strncasecmp(host + len - n, LOCAL_SUFFIXES[i], n) == 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool web_request_trusted(httpd_req_t *req) {
+  char host[GUARD_HDR_MAX] = "";
+  char origin[GUARD_HDR_MAX] = "";
+
+  size_t len = httpd_req_get_hdr_value_len(req, "Host");
+  if (len > 0) {
+    if (len >= sizeof(host) ||
+        httpd_req_get_hdr_value_str(req, "Host", host, sizeof(host)) !=
+            ESP_OK ||
+        !host_is_local(host)) {
+      ESP_LOGW(TAG, "Refused %s: Host is not a local name", req->uri);
+      return false;
+    }
+  }
+
+  len = httpd_req_get_hdr_value_len(req, "Origin");
+  if (len > 0) {
+    static const char scheme[] = "http://";
+    if (len >= sizeof(origin) ||
+        httpd_req_get_hdr_value_str(req, "Origin", origin, sizeof(origin)) !=
+            ESP_OK ||
+        strncasecmp(origin, scheme, sizeof(scheme) - 1) != 0 ||
+        strcasecmp(origin + sizeof(scheme) - 1, host) != 0) {
+      ESP_LOGW(TAG, "Refused %s: Origin %s is another site", req->uri, origin);
+      return false;
+    }
+  }
+  return true;
+}
+
+typedef esp_err_t (*uri_handler_fn)(httpd_req_t *req);
+
+// More than the server's max_uri_handlers can reach.
+#define API_HANDLERS_MAX 96
+static uri_handler_fn s_api_handlers[API_HANDLERS_MAX];
+static size_t s_api_handler_count;
+
+static esp_err_t api_guard(httpd_req_t *req) {
+  if (!web_request_trusted(req)) {
+    httpd_resp_send_err(req, HTTPD_403_FORBIDDEN,
+                        "Refused: only this device's own pages may use its "
+                        "API. Open them by IP address or <name>.local.");
+    // Close rather than drain what may be a whole firmware image.
+    return ESP_FAIL;
+  }
+  const uri_handler_fn *handler = (const uri_handler_fn *)req->user_ctx;
+  return (*handler)(req);
+}
+
+/* Registers a handler, routing everything under /api/ through the guard.
+ * The real handler rides in user_ctx, which no handler here uses. */
+static void register_uri(httpd_uri_t *uri) {
+  if (strncmp(uri->uri, "/api/", 5) == 0) {
+    if (s_api_handler_count == API_HANDLERS_MAX) {
+      ESP_LOGE(TAG, "No guard slot for %s; not registered", uri->uri);
+      return;
+    }
+    s_api_handlers[s_api_handler_count] = uri->handler;
+    uri->user_ctx = (void *)&s_api_handlers[s_api_handler_count++];
+    uri->handler = api_guard;
+  }
+  httpd_register_uri_handler(s_server, uri);
+}
+
 #define SPIFFS_CHUNK_SIZE 1024
 
 static esp_err_t serve_spiffs_file(httpd_req_t *req, const char *path,
                                    const char *content_type) {
+  // The image only ever stores <path>.gz, so trying the plain name first is
+  // what lets a page uploaded over /api/fs replace the one that shipped.
+  bool gzipped = false;
   FILE *f = fopen(path, "r");
+  if (!f) {
+    char gz_path[96];
+    snprintf(gz_path, sizeof(gz_path), "%s.gz", path);
+    gzipped = true;
+    f = fopen(gz_path, "r");
+  }
   if (!f) {
     ESP_LOGE(TAG, "Failed to open %s", path);
     httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "File not found");
     return ESP_FAIL;
   }
   httpd_resp_set_type(req, content_type);
+  if (gzipped) {
+    httpd_resp_set_hdr(req, "Content-Encoding", "gzip");
+  }
   char buf[SPIFFS_CHUNK_SIZE];
   size_t n;
-  while ((n = fread(buf, 1, sizeof(buf), f)) > 0) {
-    if (httpd_resp_send_chunk(req, buf, (ssize_t)n) != ESP_OK) {
+  do {
+    n = fread(buf, 1, sizeof(buf), f);
+    if (n > 0 && httpd_resp_send_chunk(req, buf, (ssize_t)n) != ESP_OK) {
       fclose(f);
       httpd_resp_send_chunk(req, NULL, 0);
       return ESP_FAIL;
     }
-  }
+  } while (n == sizeof(buf));
   fclose(f);
   httpd_resp_send_chunk(req, NULL, 0);
   return ESP_OK;
 }
 
-// API handlers
-static esp_err_t root_handler(httpd_req_t *req) {
-  return serve_spiffs_file(req, "/spiffs/www/index.html", "text/html");
+/* The settings pages, the log viewer, and the stylesheet and script every
+ * page shares. Each is a file in SPIFFS, so it can be replaced on its own
+ * over /api/fs/upload. */
+typedef struct {
+  const char *uri;
+  const char *path;
+  const char *type;
+} static_file_t;
+
+static const static_file_t STATIC_FILES[] = {
+    {"/", "/spiffs/www/index.html", "text/html"},
+    // Playback and audio settings are on the main page now.
+    {"/config", "/spiffs/www/index.html", "text/html"},
+    {"/network", "/spiffs/www/network.html", "text/html"},
+    // The speed test is part of the Network page now; keep old links working.
+    {"/speedtest", "/spiffs/www/network.html", "text/html"},
+    {"/logs", "/spiffs/www/logs.html", "text/html"},
+    {"/app.css", "/spiffs/www/app.css", "text/css; charset=utf-8"},
+    {"/shell.js", "/spiffs/www/shell.js", "text/javascript; charset=utf-8"},
+};
+
+static esp_err_t static_file_handler(httpd_req_t *req) {
+  const static_file_t *file = req->user_ctx;
+  return serve_spiffs_file(req, file->path, file->type);
 }
 
+// API handlers
 static esp_err_t favicon_handler(httpd_req_t *req) {
   httpd_resp_set_status(req, "204 No Content");
   httpd_resp_send(req, NULL, 0);
   return ESP_OK;
-}
-
-static esp_err_t logs_page_handler(httpd_req_t *req) {
-  return serve_spiffs_file(req, "/spiffs/www/logs.html", "text/html");
-}
-
-static esp_err_t speedtest_page_handler(httpd_req_t *req) {
-  return serve_spiffs_file(req, "/spiffs/www/speedtest.html", "text/html");
 }
 
 // Tiny endpoint used by JS for RTT timing. Returns minimal body.
@@ -187,9 +370,9 @@ static esp_err_t speedtest_upload_handler(httpd_req_t *req) {
 // Captive portal detection handlers
 // These endpoints are requested by various OS to detect captive portals
 static esp_err_t captive_portal_redirect(httpd_req_t *req) {
-  // Redirect to the configuration page
+  // Straight to the Wi-Fi setup: it is what the setup network is for
   httpd_resp_set_status(req, "302 Found");
-  httpd_resp_set_hdr(req, "Location", "http://192.168.4.1/");
+  httpd_resp_set_hdr(req, "Location", "http://192.168.4.1/network");
   httpd_resp_send(req, NULL, 0);
   return ESP_OK;
 }
@@ -263,6 +446,7 @@ static esp_err_t wifi_config_handler(httpd_req_t *req) {
   cJSON *password_json = cJSON_GetObjectItem(json, "password");
 
   cJSON *response = cJSON_CreateObject();
+  bool restart = false;
   if (ssid_json && cJSON_IsString(ssid_json)) {
     const char *ssid = cJSON_GetStringValue(ssid_json);
     const char *password = password_json && cJSON_IsString(password_json)
@@ -272,10 +456,7 @@ static esp_err_t wifi_config_handler(httpd_req_t *req) {
     esp_err_t err = settings_set_wifi_credentials(ssid, password);
     if (err == ESP_OK) {
       cJSON_AddBoolToObject(response, "success", true);
-      ESP_LOGI(TAG, "WiFi credentials saved. We are restarting...");
-      // Schedule restart
-      vTaskDelay(pdMS_TO_TICKS(1000));
-      esp_restart();
+      restart = true;
     } else {
       cJSON_AddBoolToObject(response, "success", false);
       cJSON_AddStringToObject(response, "error", esp_err_to_name(err));
@@ -292,6 +473,13 @@ static esp_err_t wifi_config_handler(httpd_req_t *req) {
   cJSON_Delete(json);
   cJSON_Delete(response);
 
+  if (restart) {
+    // Only after the reply has gone out: restarting first dropped the
+    // connection, so the page reported "Load failed" for a save that worked.
+    ESP_LOGI(TAG, "WiFi credentials saved. We are restarting...");
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    esp_restart();
+  }
   return ESP_OK;
 }
 
@@ -373,7 +561,7 @@ static esp_err_t metadata_post_handler(httpd_req_t *req) {
     return ESP_FAIL;
   }
 
-  rtsp_event_data_t data = {0};
+  playback_event_data_t data = {0};
   metadata_copy_field(json, "title", data.metadata.title);
   metadata_copy_field(json, "artist", data.metadata.artist);
   metadata_copy_field(json, "album", data.metadata.album);
@@ -382,7 +570,12 @@ static esp_err_t metadata_post_handler(httpd_req_t *req) {
   data.metadata.position_secs = metadata_uint_field(json, "position");
   cJSON_Delete(json);
 
-  rtsp_events_emit(RTSP_EVENT_METADATA, &data);
+  // Debug/manual injection: attribute it to whichever input owns the display
+  // so it is not filtered out, or to AirPlay when the device is idle.
+  const playback_source_t active = playback_events_active_source();
+  playback_events_emit(active == PLAYBACK_SOURCE_NONE ? PLAYBACK_SOURCE_AIRPLAY
+                                                      : active,
+                       PLAYBACK_EVENT_METADATA, &data);
 
   httpd_resp_set_type(req, "application/json");
   httpd_resp_send(req, "{\"success\":true}", HTTPD_RESP_USE_STRLEN);
@@ -451,22 +644,22 @@ static esp_err_t led_brightness_post_handler(httpd_req_t *req) {
 /* Read a whole request body into a NUL-terminated heap buffer. httpd_req_recv()
  * can return a short read, so keep going until the declared length arrives. */
 static char *recv_body(httpd_req_t *req, size_t max_len) {
-  int len = req->content_len;
-  if (len <= 0 || (size_t)len > max_len) {
+  size_t len = req->content_len;
+  if (len == 0 || len > max_len) {
     return NULL;
   }
-  char *buf = malloc((size_t)len + 1);
+  char *buf = malloc(len + 1);
   if (!buf) {
     return NULL;
   }
-  int got = 0;
+  size_t got = 0;
   while (got < len) {
-    int r = httpd_req_recv(req, buf + got, (size_t)(len - got));
+    int r = httpd_req_recv(req, buf + got, len - got);
     if (r <= 0) {
       free(buf);
       return NULL;
     }
-    got += r;
+    got += (size_t)r;
   }
   buf[len] = '\0';
   return buf;
@@ -530,7 +723,7 @@ static esp_err_t channel_mode_post_handler(httpd_req_t *req) {
 }
 
 /* AirPlay dB scale, matching playback_control's clamp. */
-#define VOLUME_UI_MIN_DB -30.0f
+#define VOLUME_UI_MIN_DB (-30.0f)
 #define VOLUME_UI_MAX_DB 0.0f
 
 static esp_err_t volume_get_handler(httpd_req_t *req) {
@@ -559,7 +752,7 @@ static esp_err_t volume_post_handler(httpd_req_t *req) {
   cJSON *json = cJSON_Parse(content);
   free(content);
   cJSON *val = json ? cJSON_GetObjectItem(json, "volume_db") : NULL;
-  if (!cJSON_IsNumber(val)) {
+  if (!val || !cJSON_IsNumber(val)) {
     cJSON_Delete(json);
     httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Expected volume_db");
     return ESP_FAIL;
@@ -573,7 +766,7 @@ static esp_err_t volume_post_handler(httpd_req_t *req) {
   if (db > VOLUME_UI_MAX_DB) {
     db = VOLUME_UI_MAX_DB;
   }
-  settings_set_volume(db);
+  playback_control_set_volume_db(db);
   if (persist) {
     settings_persist_volume();
   }
@@ -738,6 +931,74 @@ static esp_err_t ch_trim_post_handler(httpd_req_t *req) {
 #endif /* DAC_HAS_CH_TRIM */
 
 #ifdef CONFIG_DAC_TAS58XX
+/* How the primary amplifier is wired: bridged (PBTL) mono or a stereo pair.
+ * Available on every TAS58xx board, single- or dual-DAC alike — a bridged
+ * primary drives one speaker from the summed L+R. */
+static esp_err_t pbtl_get_handler(httpd_req_t *req) {
+  cJSON *json = cJSON_CreateObject();
+  cJSON_AddNumberToObject(json, "devices", dac_tas58xx_get_device_count());
+  cJSON_AddBoolToObject(json, "pbtl", dac_tas58xx_get_first_pbtl());
+  cJSON_AddBoolToObject(json, "restart_required",
+                        dac_tas58xx_get_first_pbtl() !=
+                            dac_tas58xx_get_active_first_pbtl());
+  cJSON_AddBoolToObject(json, "forced", dac_tas58xx_is_first_pbtl_forced());
+  cJSON_AddBoolToObject(json, "success", true);
+  char *json_str = cJSON_Print(json);
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_send(req, json_str, HTTPD_RESP_USE_STRLEN);
+  free(json_str);
+  cJSON_Delete(json);
+  return ESP_OK;
+}
+
+static esp_err_t pbtl_post_handler(httpd_req_t *req) {
+  char *content = recv_body(req, 128);
+  if (!content) {
+    httpd_resp_send_500(req);
+    return ESP_FAIL;
+  }
+
+  cJSON *json = cJSON_Parse(content);
+  free(content);
+  if (!json) {
+    httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid JSON");
+    return ESP_FAIL;
+  }
+
+  cJSON *response = cJSON_CreateObject();
+
+  if (dac_tas58xx_is_first_pbtl_forced()) {
+    /* PBTL mode is forced by configuration - reject any changes */
+    cJSON_AddBoolToObject(response, "success", false);
+    cJSON_AddStringToObject(
+        response, "error",
+        "PBTL mode is forced by configuration and cannot be changed");
+    cJSON_AddBoolToObject(response, "restart_required", false);
+  } else {
+    cJSON *val = cJSON_GetObjectItem(json, "pbtl");
+    if (!val || !cJSON_IsBool(val)) {
+      cJSON_AddBoolToObject(response, "success", false);
+      cJSON_AddStringToObject(response, "error", "Expected {\"pbtl\": bool}");
+    } else {
+      const bool pbtl = cJSON_IsTrue(val);
+      dac_tas58xx_set_first_pbtl(pbtl);
+      settings_set_first_pbtl(pbtl);
+      cJSON_AddBoolToObject(response, "success", true);
+      /* PBTL is a control-port setting that can only be changed while the
+       * output stage is idle, so the change lands on the next boot. */
+      cJSON_AddBoolToObject(response, "restart_required", true);
+    }
+  }
+
+  char *json_str = cJSON_Print(response);
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_send(req, json_str, HTTPD_RESP_USE_STRLEN);
+  free(json_str);
+  cJSON_Delete(json);
+  cJSON_Delete(response);
+  return ESP_OK;
+}
+
 /* How the second amplifier on a dual-DAC board is wired: bridged (PBTL) mono
  * or a stereo pair. Any crossover between the two is a matter for the biquad
  * chains, so this is the whole of the dual-DAC configuration. */
@@ -794,7 +1055,202 @@ static esp_err_t dual_mode_post_handler(httpd_req_t *req) {
   cJSON_Delete(response);
   return ESP_OK;
 }
+
+/* The two gains. The digital gain, set by hand, is the level AirPlay's full
+ * volume maps to. The analog gain matches the supply where the board can read
+ * it ("analog_auto"), so the one that matches each fixed USB-PD voltage
+ * comes along. */
+static esp_err_t send_digital_gain(httpd_req_t *req) {
+  static const int volts[] = {5, 9, 12, 15, 20};
+  const int supply_mv = dac_tas58xx_get_supply_mv();
+  cJSON *json = cJSON_CreateObject();
+  cJSON_AddBoolToObject(json, "success", true);
+  cJSON_AddNumberToObject(json, "db", dac_tas58xx_get_full_volume_db());
+  cJSON_AddNumberToObject(json, "min_db", TAS58XX_FULL_VOLUME_MIN_DB);
+  cJSON_AddNumberToObject(json, "analog_db", dac_tas58xx_get_analog_gain_db());
+  cJSON_AddNumberToObject(json, "analog_min_db", TAS58XX_ANALOG_GAIN_MIN_DB);
+  cJSON_AddBoolToObject(json, "analog_auto", dac_tas58xx_get_analog_auto());
+  cJSON_AddNumberToObject(json, "supply_mv", supply_mv);
+  if (supply_mv > 0) {
+    cJSON_AddNumberToObject(json, "clean_db", dac_tas58xx_clean_db(supply_mv));
+  }
+  cJSON *rec = cJSON_AddArrayToObject(json, "recommended");
+  for (size_t i = 0; i < sizeof volts / sizeof volts[0]; i++) {
+    cJSON *r = cJSON_CreateObject();
+    cJSON_AddNumberToObject(r, "volts", volts[i]);
+    cJSON_AddNumberToObject(r, "db", dac_tas58xx_clean_db(volts[i] * 1000));
+    cJSON_AddItemToArray(rec, r);
+  }
+  char *json_str = cJSON_Print(json);
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_send(req, json_str, HTTPD_RESP_USE_STRLEN);
+  free(json_str);
+  cJSON_Delete(json);
+  return ESP_OK;
+}
+
+static esp_err_t digital_gain_get_handler(httpd_req_t *req) {
+  return send_digital_gain(req);
+}
+
+/* {"db": -11} sets the digital gain. {"analog_db": -11} sets the analog gain
+ * by hand; {"analog_auto": true} has it match the supply, and
+ * {"analog_auto": false} keeps the one it has reached. */
+static esp_err_t digital_gain_post_handler(httpd_req_t *req) {
+  char *content = recv_body(req, 64);
+  if (!content) {
+    httpd_resp_send_500(req);
+    return ESP_FAIL;
+  }
+  cJSON *json = cJSON_Parse(content);
+  free(content);
+  const cJSON *db = json ? cJSON_GetObjectItem(json, "db") : NULL;
+  const cJSON *analog = json ? cJSON_GetObjectItem(json, "analog_db") : NULL;
+  const cJSON *automatic =
+      json ? cJSON_GetObjectItem(json, "analog_auto") : NULL;
+  if (cJSON_IsBool(automatic)) {
+    const bool on = cJSON_IsTrue(automatic);
+    cJSON_Delete(json);
+    if (on) {
+      dac_tas58xx_set_analog_auto(true);
+    } else {
+      dac_tas58xx_set_analog_gain_db(dac_tas58xx_get_analog_gain_db());
+      settings_set_analog_gain_db(dac_tas58xx_get_analog_gain_db());
+    }
+    settings_set_analog_auto(on);
+    return send_digital_gain(req);
+  }
+  if (cJSON_IsNumber(analog)) {
+    const double analog_db = analog->valuedouble;
+    cJSON_Delete(json);
+    if (analog_db > 0.0 || analog_db < TAS58XX_ANALOG_GAIN_MIN_DB) {
+      httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                          "Expected {\"analog_db\": -15.5..0}");
+      return ESP_FAIL;
+    }
+    dac_tas58xx_set_analog_gain_db((float)analog_db);
+    settings_set_analog_gain_db(dac_tas58xx_get_analog_gain_db());
+    settings_set_analog_auto(false);
+    return send_digital_gain(req);
+  }
+  if (db == NULL || !cJSON_IsNumber(db) || db->valuedouble > 0.0 ||
+      db->valuedouble < TAS58XX_FULL_VOLUME_MIN_DB) {
+    cJSON_Delete(json);
+    httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                        "Expected {\"db\": -30..0}, {\"analog_db\": "
+                        "-15.5..0} or {\"analog_auto\": bool}");
+    return ESP_FAIL;
+  }
+  const float gain_db = (float)db->valuedouble;
+  cJSON_Delete(json);
+
+  dac_tas58xx_set_full_volume_db(gain_db);
+  settings_set_full_volume_db(dac_tas58xx_get_full_volume_db());
+  return send_digital_gain(req);
+}
 #endif /* CONFIG_DAC_TAS58XX */
+
+#ifdef CONFIG_HUSB238A
+/* The USB-PD trigger: what the charger offers, what it agreed to, and the
+ * voltage the board asks it for on every boot. */
+static esp_err_t send_usb_pd(httpd_req_t *req) {
+  husb238a_status_t status;
+  const esp_err_t err = husb238a_get_status(&status);
+
+  cJSON *json = cJSON_CreateObject();
+  cJSON_AddBoolToObject(json, "success", err == ESP_OK);
+  if (err != ESP_OK) {
+    cJSON_AddStringToObject(json, "error", esp_err_to_name(err));
+  }
+  cJSON_AddBoolToObject(json, "attached", status.attached);
+  cJSON_AddBoolToObject(json, "pd", status.pd);
+  cJSON_AddBoolToObject(json, "auto", settings_get_usb_pd_auto());
+  cJSON_AddNumberToObject(json, "volts", status.requested_volts);
+  cJSON_AddNumberToObject(json, "max_volts", status.max_volts);
+  cJSON_AddNumberToObject(json, "supply_mv", status.supply_mv);
+  cJSON *choices = cJSON_AddArrayToObject(json, "choices");
+  cJSON *offers = cJSON_AddArrayToObject(json, "offers");
+  for (int i = 0; i < HUSB238A_FIXED_PDOS; i++) {
+    const int volts = husb238a_fixed_volts[i];
+    if (volts <= status.max_volts) {
+      cJSON_AddItemToArray(choices, cJSON_CreateNumber(volts));
+    }
+    if (status.offer_ma[i] > 0) {
+      cJSON *offer = cJSON_CreateObject();
+      cJSON_AddNumberToObject(offer, "volts", volts);
+      cJSON_AddNumberToObject(offer, "ma", status.offer_ma[i]);
+      cJSON_AddItemToArray(offers, offer);
+    }
+  }
+
+  char *json_str = cJSON_Print(json);
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_send(req, json_str, HTTPD_RESP_USE_STRLEN);
+  free(json_str);
+  cJSON_Delete(json);
+  return ESP_OK;
+}
+
+static esp_err_t usb_pd_get_handler(httpd_req_t *req) {
+  return send_usb_pd(req);
+}
+
+/* Asking the charger for another voltage takes it a second or two, and the
+ * reply waits for it, so it reports the supply that resulted. {"volts": 12}
+ * sets one by hand; {"auto": true} asks for the highest the charger offers,
+ * now and on every boot; {"auto": false} keeps the one it is running at. */
+static esp_err_t usb_pd_post_handler(httpd_req_t *req) {
+  char *content = recv_body(req, 64);
+  if (!content) {
+    httpd_resp_send_500(req);
+    return ESP_FAIL;
+  }
+  cJSON *json = cJSON_Parse(content);
+  free(content);
+  const cJSON *val = json ? cJSON_GetObjectItem(json, "volts") : NULL;
+  const cJSON *automatic = json ? cJSON_GetObjectItem(json, "auto") : NULL;
+  if (cJSON_IsBool(automatic)) {
+    const bool on = cJSON_IsTrue(automatic);
+    cJSON_Delete(json);
+    husb238a_status_t status;
+    if (!husb238a_present() || husb238a_get_status(&status) != ESP_OK) {
+      httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                          "This board has no USB-PD trigger");
+      return ESP_FAIL;
+    }
+    if (on) {
+      husb238a_request(status.max_volts);
+    } else {
+      settings_set_usb_pd_volts(status.supply_mv > 0 ? status.supply_mv / 1000
+                                                     : status.requested_volts);
+    }
+    settings_set_usb_pd_auto(on);
+    return send_usb_pd(req);
+  }
+  if (val == NULL || !cJSON_IsNumber(val)) {
+    cJSON_Delete(json);
+    httpd_resp_send_err(
+        req, HTTPD_400_BAD_REQUEST,
+        "Expected {\"volts\": 5, 9, 12, 15 or 20} or {\"auto\": bool}");
+    return ESP_FAIL;
+  }
+  const int volts = val->valueint;
+  cJSON_Delete(json);
+
+  const esp_err_t err = husb238a_request(volts);
+  if (err == ESP_ERR_INVALID_ARG || err == ESP_ERR_INVALID_STATE) {
+    httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                        err == ESP_ERR_INVALID_ARG
+                            ? "Not a voltage this board can ask for"
+                            : "This board has no USB-PD trigger");
+    return ESP_FAIL;
+  }
+  /* Kept even if this charger cannot give it, for one that can. */
+  settings_set_usb_pd_volts(volts);
+  settings_set_usb_pd_auto(false);
+  return send_usb_pd(req);
+}
+#endif /* CONFIG_HUSB238A */
 
 static esp_err_t airplay_mode_get_handler(httpd_req_t *req) {
   cJSON *json = cJSON_CreateObject();
@@ -931,7 +1387,22 @@ static esp_err_t system_info_handler(httpd_req_t *req) {
   cJSON_AddStringToObject(info, "device_name", device_name);
   cJSON_AddBoolToObject(info, "wifi_connected", wifi_connected);
   cJSON_AddBoolToObject(info, "eth_connected", eth_connected);
+#ifdef CONFIG_ETH_W5500_ENABLED
+  cJSON_AddBoolToObject(info, "eth_supported", true);
+#else
+  cJSON_AddBoolToObject(info, "eth_supported", false);
+#endif
   cJSON_AddNumberToObject(info, "free_heap", esp_get_free_heap_size());
+  /* free_heap counts PSRAM too, so it says nothing about the internal RAM
+   * that tasks, DMA and the USB stack need. The minimum is the low-water mark
+   * since boot, which is what shows whether a board has headroom. */
+  cJSON_AddNumberToObject(info, "internal_free",
+                          heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+  cJSON_AddNumberToObject(info, "internal_min_free",
+                          heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL));
+  cJSON_AddNumberToObject(
+      info, "internal_largest",
+      heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
 
   // WiFi link diagnostics (only meaningful when associated as STA)
   if (wifi_connected) {
@@ -969,9 +1440,9 @@ static esp_err_t system_info_handler(httpd_req_t *req) {
   cJSON_AddStringToObject(info, "firmware_version", app_desc->version);
   cJSON_AddStringToObject(info, "reset_reason",
                           reset_reason_str(esp_reset_reason()));
-  cJSON_AddNumberToObject(info, "uptime_s",
-                          (double)(esp_timer_get_time() / 1000000));
-#ifdef CONFIG_DAC_TAS58XX
+  const int64_t uptime_s = esp_timer_get_time() / 1000000;
+  cJSON_AddNumberToObject(info, "uptime_s", (double)uptime_s);
+#ifdef HAS_BQ_API
   cJSON_AddBoolToObject(info, "eq_supported", true);
 #else
   cJSON_AddBoolToObject(info, "eq_supported", false);
@@ -983,8 +1454,15 @@ static esp_err_t system_info_handler(httpd_req_t *req) {
 #endif
 #ifdef CONFIG_DAC_TAS58XX
   cJSON_AddBoolToObject(info, "dual_supported", true);
+  /* As a USB-PD trigger agreed it or a TAS5825M measures it; 0 if unknown. */
+  cJSON_AddNumberToObject(info, "supply_mv", dac_tas58xx_get_supply_mv());
 #else
   cJSON_AddBoolToObject(info, "dual_supported", false);
+#endif
+#ifdef CONFIG_HUSB238A
+  cJSON_AddBoolToObject(info, "usb_pd_supported", husb238a_present());
+#else
+  cJSON_AddBoolToObject(info, "usb_pd_supported", false);
 #endif
 #ifdef CONFIG_DAC_TAS57XX
   cJSON_AddBoolToObject(info, "hf1_supported", dac_tas57xx_hf1_available());
@@ -992,6 +1470,23 @@ static esp_err_t system_info_handler(httpd_req_t *req) {
 #else
   cJSON_AddBoolToObject(info, "hf1_supported", false);
   cJSON_AddBoolToObject(info, "hf3_supported", false);
+#endif
+#ifdef CONFIG_SENDSPIN_ENABLE
+  cJSON_AddBoolToObject(info, "sendspin_supported", true);
+  cJSON_AddBoolToObject(info, "sendspin_enabled",
+                        settings_sendspin_enabled_configured());
+  cJSON_AddBoolToObject(info, "sendspin_active", settings_sendspin_enabled());
+  /* The two secrets a server needs to adopt this device: the PIN an operator
+   * types into a pairing prompt, and the token a server enrols itself with.
+   * Anyone who can read either can pair, so they ride on the same
+   * authentication as the rest of this API.  Both read empty while Sendspin
+   * is switched off, because no identity has been derived. */
+  cJSON_AddStringToObject(info, "sendspin_pairing_token",
+                          sendspin_pairing_token());
+  cJSON_AddStringToObject(info, "sendspin_pairing_pin", sendspin_pairing_pin());
+  cJSON_AddNumberToObject(info, "sendspin_paired", sendspin_paired_count());
+#else
+  cJSON_AddBoolToObject(info, "sendspin_supported", false);
 #endif
 
   cJSON_AddItemToObject(json, "info", info);
@@ -1003,6 +1498,104 @@ static esp_err_t system_info_handler(httpd_req_t *req) {
   free(json_str);
   cJSON_Delete(json);
 
+  return ESP_OK;
+}
+
+// The name the services were started with; a saved name differs until the
+// next boot.
+static char s_boot_name[65];
+
+static const char *source_name(playback_source_t source) {
+  switch (source) {
+  case PLAYBACK_SOURCE_AIRPLAY:
+    return "airplay";
+  case PLAYBACK_SOURCE_BLUETOOTH:
+    return "bluetooth";
+  case PLAYBACK_SOURCE_USB:
+    return "usb";
+  case PLAYBACK_SOURCE_SENDSPIN:
+    return "sendspin";
+  default:
+    return "";
+  }
+}
+
+/* Everything the status strip at the top of each page shows, in one request,
+ * so a page polls one endpoint: the link, what is playing, the volume, and
+ * the saved settings that wait for a restart. */
+static esp_err_t status_handler(httpd_req_t *req) {
+  cJSON *json = cJSON_CreateObject();
+
+  char name[65] = {0};
+  settings_get_device_name(name, sizeof(name));
+  cJSON_AddStringToObject(json, "name", name);
+
+  char ip_str[16] = {0};
+  const char *link = "none";
+  if (ethernet_is_connected()) {
+    link = "ethernet";
+    ethernet_get_ip_str(ip_str, sizeof(ip_str));
+  } else if (wifi_is_connected()) {
+    link = "wifi";
+    wifi_get_ip_str(ip_str, sizeof(ip_str));
+    wifi_ap_record_t ap;
+    if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) {
+      cJSON_AddNumberToObject(json, "rssi", ap.rssi);
+    }
+  }
+  cJSON_AddStringToObject(json, "link", link);
+  cJSON_AddStringToObject(json, "ip", ip_str);
+
+  const playback_source_t source = playback_events_active_source();
+  cJSON_AddStringToObject(json, "source", source_name(source));
+  cJSON_AddStringToObject(json, "state",
+                          source == PLAYBACK_SOURCE_NONE  ? "idle"
+                          : playback_events_any_playing() ? "playing"
+                                                          : "connected");
+  playback_metadata_t meta;
+  if (playback_events_get_metadata(&meta)) {
+    cJSON_AddStringToObject(json, "title", meta.title);
+    cJSON_AddStringToObject(json, "artist", meta.artist);
+    cJSON_AddStringToObject(json, "album", meta.album);
+  }
+
+  float db = -15.0f;
+  settings_get_volume(&db);
+  cJSON_AddNumberToObject(json, "volume_db", db);
+  cJSON_AddNumberToObject(json, "volume_min", VOLUME_UI_MIN_DB);
+  cJSON_AddNumberToObject(json, "volume_max", VOLUME_UI_MAX_DB);
+  cJSON_AddBoolToObject(json, "muted", playback_control_is_muted());
+
+  cJSON *restart = cJSON_AddArrayToObject(json, "restart");
+  if (s_boot_name[0] && strcmp(name, s_boot_name) != 0) {
+    cJSON_AddItemToArray(restart, cJSON_CreateString("Device name"));
+  }
+  if (settings_airplay_v1_configured() != settings_airplay_v1()) {
+    cJSON_AddItemToArray(restart, cJSON_CreateString("AirPlay mode"));
+  }
+#ifdef CONFIG_SENDSPIN_ENABLE
+  if (settings_sendspin_enabled_configured() != settings_sendspin_enabled()) {
+    cJSON_AddItemToArray(restart, cJSON_CreateString("Sendspin"));
+  }
+#endif
+#ifdef CONFIG_DAC_TAS58XX
+  if (dac_tas58xx_get_first_pbtl() != dac_tas58xx_get_active_first_pbtl()) {
+    cJSON_AddItemToArray(restart, cJSON_CreateString("Amplifier wiring"));
+  }
+  if (dac_tas58xx_get_device_count() > 1 &&
+      dac_tas58xx_get_second_pbtl() != dac_tas58xx_get_active_second_pbtl()) {
+    cJSON_AddItemToArray(restart,
+                         cJSON_CreateString("Second amplifier wiring"));
+  }
+#endif
+  cJSON_AddBoolToObject(json, "success", true);
+
+  char *json_str = cJSON_PrintUnformatted(json);
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+  httpd_resp_send(req, json_str, HTTPD_RESP_USE_STRLEN);
+  free(json_str);
+  cJSON_Delete(json);
   return ESP_OK;
 }
 
@@ -1022,6 +1615,147 @@ static esp_err_t system_restart_handler(httpd_req_t *req) {
 
   return ESP_OK;
 }
+
+#ifdef CONFIG_SENDSPIN_ENABLE
+static esp_err_t sendspin_mode_get_handler(httpd_req_t *req) {
+  cJSON *json = cJSON_CreateObject();
+  cJSON_AddBoolToObject(json, "enabled",
+                        settings_sendspin_enabled_configured());
+  cJSON_AddBoolToObject(json, "restart_required",
+                        settings_sendspin_enabled_configured() !=
+                            settings_sendspin_enabled());
+  cJSON_AddBoolToObject(json, "success", true);
+  char *json_str = cJSON_Print(json);
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_send(req, json_str, HTTPD_RESP_USE_STRLEN);
+  free(json_str);
+  cJSON_Delete(json);
+  return ESP_OK;
+}
+
+static esp_err_t sendspin_mode_post_handler(httpd_req_t *req) {
+  char *content = recv_body(req, 128);
+  if (!content) {
+    httpd_resp_send_500(req);
+    return ESP_FAIL;
+  }
+
+  cJSON *json = cJSON_Parse(content);
+  free(content);
+  if (!json) {
+    httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid JSON");
+    return ESP_FAIL;
+  }
+
+  cJSON *response = cJSON_CreateObject();
+  cJSON *val = cJSON_GetObjectItem(json, "enabled");
+  if (!val || !cJSON_IsBool(val)) {
+    cJSON_AddBoolToObject(response, "success", false);
+    cJSON_AddStringToObject(response, "error", "Expected {\"enabled\": bool}");
+  } else {
+    const bool enabled = cJSON_IsTrue(val);
+    esp_err_t err = settings_set_sendspin_enabled(enabled);
+    cJSON_AddBoolToObject(response, "success", err == ESP_OK);
+    if (err != ESP_OK) {
+      cJSON_AddStringToObject(response, "error", esp_err_to_name(err));
+    } else {
+      cJSON_AddBoolToObject(response, "restart_required",
+                            enabled != settings_sendspin_enabled());
+    }
+  }
+
+  char *json_str = cJSON_Print(response);
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_send(req, json_str, HTTPD_RESP_USE_STRLEN);
+  free(json_str);
+  cJSON_Delete(json);
+  cJSON_Delete(response);
+  return ESP_OK;
+}
+
+static esp_err_t sendspin_unpair_handler(httpd_req_t *req) {
+  bool force = false;
+  char qbuf[64];
+  if (httpd_req_get_url_query_str(req, qbuf, sizeof(qbuf)) == ESP_OK) {
+    char val[8];
+    if (httpd_query_key_value(qbuf, "force", val, sizeof(val)) == ESP_OK) {
+      force = strcmp(val, "1") == 0 || strcmp(val, "true") == 0;
+    }
+  }
+
+  /* Forgetting only this side leaves the server offering a PSK the board can
+   * no longer resolve, and that handshake fails silently at both ends.  While
+   * a server is connected it can be unpaired from its own UI, which prunes
+   * both records, so send the operator there rather than into the deadlock. */
+  if (!force && sendspin_paired_count() > 0 && sendspin_server_connected()) {
+    httpd_resp_set_status(req, "409 Conflict");
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(
+        req,
+        "{\"success\":false,\"error\":\"a server is connected; unpair from the "
+        "server so both sides forget, or repeat with ?force=1\"}");
+    return ESP_OK;
+  }
+
+  const esp_err_t err = sendspin_forget_pairings();
+  if (err == ESP_ERR_INVALID_STATE) {
+    httpd_resp_set_status(req, "409 Conflict");
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(
+        req, "{\"success\":false,\"error\":\"Sendspin is not running\"}");
+    return ESP_OK;
+  }
+  if (err != ESP_OK) {
+    httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
+                        esp_err_to_name(err));
+    return ESP_FAIL;
+  }
+
+  cJSON *json = cJSON_CreateObject();
+  cJSON_AddBoolToObject(json, "success", true);
+  cJSON_AddNumberToObject(json, "sendspin_paired", sendspin_paired_count());
+
+  char *json_str = cJSON_Print(json);
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_send(req, json_str, HTTPD_RESP_USE_STRLEN);
+  free(json_str);
+  cJSON_Delete(json);
+
+  ESP_LOGI(TAG, "Sendspin pairings cleared via web interface");
+  return ESP_OK;
+}
+
+static esp_err_t sendspin_reset_identity_handler(httpd_req_t *req) {
+  const esp_err_t err = sendspin_reset_identity();
+  if (err == ESP_ERR_INVALID_STATE) {
+    httpd_resp_set_status(req, "409 Conflict");
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(
+        req, "{\"success\":false,\"error\":\"Sendspin is not running\"}");
+    return ESP_OK;
+  }
+  if (err != ESP_OK) {
+    httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
+                        esp_err_to_name(err));
+    return ESP_FAIL;
+  }
+
+  cJSON *json = cJSON_CreateObject();
+  cJSON_AddBoolToObject(json, "success", true);
+  cJSON_AddStringToObject(json, "sendspin_pairing_token",
+                          sendspin_pairing_token());
+  cJSON_AddNumberToObject(json, "sendspin_paired", sendspin_paired_count());
+
+  char *json_str = cJSON_Print(json);
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_send(req, json_str, HTTPD_RESP_USE_STRLEN);
+  free(json_str);
+  cJSON_Delete(json);
+
+  ESP_LOGI(TAG, "Sendspin identity reset via web interface");
+  return ESP_OK;
+}
+#endif
 
 /* ================================================================== */
 /*  SPIFFS File Management API                                         */
@@ -1169,12 +1903,13 @@ static esp_err_t fs_download_handler(httpd_req_t *req) {
   httpd_resp_set_type(req, "application/octet-stream");
   char buf[SPIFFS_CHUNK_SIZE];
   size_t n;
-  while ((n = fread(buf, 1, sizeof(buf), f)) > 0) {
-    if (httpd_resp_send_chunk(req, buf, (ssize_t)n) != ESP_OK) {
+  do {
+    n = fread(buf, 1, sizeof(buf), f);
+    if (n > 0 && httpd_resp_send_chunk(req, buf, (ssize_t)n) != ESP_OK) {
       fclose(f);
       return ESP_FAIL;
     }
-  }
+  } while (n == sizeof(buf));
   fclose(f);
   httpd_resp_send_chunk(req, NULL, 0);
   return ESP_OK;
@@ -1794,27 +2529,228 @@ static esp_err_t hf_flow_post_handler(httpd_req_t *req) {
 #endif /* CONFIG_DAC_TAS57XX */
 
 /* ================================================================== */
-/*  Biquad chains  (only when TAS58xx DAC is configured)               */
+/*  Biquad chains  (TAS58xx DSP, or the software EQ on plain DACs)     */
 /* ================================================================== */
 
-#ifdef CONFIG_DAC_TAS58XX
+#ifdef HAS_BQ_API
 
 /* ---------- Parametric biquad chains ---------- */
+
+/* The /bq page drives either the TAS58xx DSP or, on plain DACs, the software
+ * EQ. These wrappers are the whole of what the handlers need from either, so
+ * the JSON side is shared. */
+#ifdef CONFIG_DAC_TAS58XX
+
+#define EQB_CHANNELS    TAS58XX_BQ_CHANNELS
+#define EQB_SLOTS       TAS58XX_BQ_SLOTS
+#define EQB_GAIN_MIN_DB TAS58XX_GAIN_MIN_DB
+#define EQB_GAIN_MAX_DB TAS58XX_GAIN_MAX_DB
+#define EQB_MIX_COUNT   TAS58XX_MIX_COUNT
+#define EQB_MIX_STEREO  TAS58XX_MIX_STEREO
+
+static int eqb_devices(void) {
+  return dac_tas58xx_get_device_count();
+}
+
+/* Which amplifier a chain belongs to, so the page can label the columns
+ * without duplicating the dual-DAC wiring logic. */
+static const char *eqb_role(int dev) {
+  if (dev == 0) {
+    return dac_tas58xx_get_active_first_pbtl() ? "mono" : "stereo";
+  }
+  return dac_tas58xx_get_active_second_pbtl() ? "mono" : "stereo";
+}
+
+static bool eqb_pbtl(int dev) {
+  return dac_tas58xx_is_pbtl(dev);
+}
+static uint32_t eqb_rate(int dev) {
+  return dac_tas58xx_bq_device_sample_rate(dev);
+}
+static bool eqb_get_ganged(int dev) {
+  return dac_tas58xx_bq_get_ganged(dev);
+}
+static void eqb_set_ganged(int dev, bool ganged) {
+  dac_tas58xx_bq_set_ganged(dev, ganged);
+}
+static bool eqb_get_chain(int dev, int ch, tas58xx_bq_t out[EQB_SLOTS]) {
+  return dac_tas58xx_bq_get(dev, ch, out);
+}
+static esp_err_t eqb_set_chain(int dev, int ch,
+                               const tas58xx_bq_t in[EQB_SLOTS]) {
+  return dac_tas58xx_bq_set(dev, ch, in);
+}
+/* The chip's coefficient words stop at 16, so a boost steep enough to need
+ * more is turned away here, with a reason the page can show. */
+static bool eqb_check(const tas58xx_bq_t *bq, const char **why) {
+  if (!tas58xx_bq_validate(bq, why)) {
+    return false;
+  }
+  if (!tas58xx_bq_fits(bq)) {
+    *why = "too much boost for the amplifier's DSP";
+    return false;
+  }
+  return true;
+}
+static esp_err_t eqb_commit(void) {
+  return dac_tas58xx_bq_commit();
+}
+static esp_err_t eqb_revert(void) {
+  return dac_tas58xx_bq_revert();
+}
+static float eqb_get_gain(int dev, int ch) {
+  return dac_tas58xx_get_gain_db(dev, ch);
+}
+static bool eqb_get_mute(int dev, int ch) {
+  return dac_tas58xx_get_ch_mute(dev, ch);
+}
+static int eqb_get_mix(int dev) {
+  return (int)dac_tas58xx_get_mix(dev);
+}
+static bool eqb_can_route(int dev) {
+  return dac_tas58xx_can_route(dev);
+}
+
+static void eqb_set_gain(int dev, int ch, float db) {
+  dac_tas58xx_set_gain_db(dev, ch, db);
+  float saved[SETTINGS_AMP_OUTPUTS];
+  for (int i = 0; i < SETTINGS_AMP_OUTPUTS; i++) {
+    saved[i] = dac_tas58xx_get_gain_db(i / SETTINGS_AMP_CHANNELS,
+                                       i % SETTINGS_AMP_CHANNELS);
+  }
+  settings_set_amp_gain(saved);
+}
+
+static void eqb_set_mute(int dev, int ch, bool mute) {
+  dac_tas58xx_set_ch_mute(dev, ch, mute);
+  uint8_t saved[SETTINGS_AMP_OUTPUTS];
+  for (int i = 0; i < SETTINGS_AMP_OUTPUTS; i++) {
+    saved[i] = dac_tas58xx_get_ch_mute(i / SETTINGS_AMP_CHANNELS,
+                                       i % SETTINGS_AMP_CHANNELS);
+  }
+  settings_set_amp_mute(saved);
+}
+
+static void eqb_set_mix(int dev, int mix) {
+  dac_tas58xx_set_mix(dev, (tas58xx_mix_t)mix);
+  uint8_t saved[SETTINGS_AMPS];
+  for (int i = 0; i < SETTINGS_AMPS; i++) {
+    saved[i] = (uint8_t)dac_tas58xx_get_mix(i);
+  }
+  settings_set_amp_mix(saved);
+}
+/* The DSP's filters have headroom of their own; nothing is turned down. */
+static bool eqb_preamp_db(float *db) {
+  (void)db;
+  return false;
+}
+
+#else /* CONFIG_SOFTWARE_EQ */
+
+#define EQB_CHANNELS    AUDIO_EQ_CHANNELS
+#define EQB_SLOTS       AUDIO_EQ_SLOTS
+#define EQB_GAIN_MIN_DB AUDIO_EQ_TRIM_MIN_DB
+#define EQB_GAIN_MAX_DB AUDIO_EQ_TRIM_MAX_DB
+#define EQB_MIX_COUNT   4
+#define EQB_MIX_STEREO  0
+
+/* The page's input routings, in its order, as output channel modes: the
+ * software path already has that mixer, so both controls share it. */
+static const audio_channel_mode_t eqb_mix_modes[EQB_MIX_COUNT] = {
+    AUDIO_CHANNEL_STEREO,
+    AUDIO_CHANNEL_MONO,
+    AUDIO_CHANNEL_LEFT,
+    AUDIO_CHANNEL_RIGHT,
+};
+
+static int eqb_devices(void) {
+  return 1;
+}
+static const char *eqb_role(int dev) {
+  (void)dev;
+  return "stereo";
+}
+static bool eqb_pbtl(int dev) {
+  (void)dev;
+  return false;
+}
+static uint32_t eqb_rate(int dev) {
+  (void)dev;
+  return audio_eq_get_rate();
+}
+static bool eqb_get_ganged(int dev) {
+  (void)dev;
+  return audio_eq_get_ganged();
+}
+static void eqb_set_ganged(int dev, bool ganged) {
+  (void)dev;
+  audio_eq_set_ganged(ganged);
+}
+static bool eqb_get_chain(int dev, int ch, tas58xx_bq_t out[EQB_SLOTS]) {
+  (void)dev;
+  return audio_eq_get_chain(ch, out);
+}
+static esp_err_t eqb_set_chain(int dev, int ch,
+                               const tas58xx_bq_t in[EQB_SLOTS]) {
+  (void)dev;
+  return audio_eq_set_chain(ch, in);
+}
+static bool eqb_check(const tas58xx_bq_t *bq, const char **why) {
+  return tas58xx_bq_validate(bq, why);
+}
+static esp_err_t eqb_commit(void) {
+  return audio_eq_commit();
+}
+static esp_err_t eqb_revert(void) {
+  return audio_eq_revert();
+}
+static float eqb_get_gain(int dev, int ch) {
+  (void)dev;
+  return audio_eq_get_trim_db(ch);
+}
+static void eqb_set_gain(int dev, int ch, float db) {
+  (void)dev;
+  audio_eq_set_trim_db(ch, db);
+}
+static bool eqb_get_mute(int dev, int ch) {
+  (void)dev;
+  return audio_eq_get_mute(ch);
+}
+static void eqb_set_mute(int dev, int ch, bool mute) {
+  (void)dev;
+  audio_eq_set_mute(ch, mute);
+}
+static int eqb_get_mix(int dev) {
+  (void)dev;
+  audio_channel_mode_t mode = audio_output_get_channel_mode();
+  for (int m = 0; m < EQB_MIX_COUNT; m++) {
+    if (eqb_mix_modes[m] == mode) {
+      return m;
+    }
+  }
+  return 0;
+}
+static void eqb_set_mix(int dev, int mix) {
+  (void)dev;
+  audio_output_set_channel_mode(eqb_mix_modes[mix]);
+}
+static bool eqb_can_route(int dev) {
+  (void)dev;
+  return true;
+}
+/* What the software EQ takes off ahead of the filters to fit the boosts. */
+static bool eqb_preamp_db(float *db) {
+  *db = audio_eq_get_preamp_db();
+  return true;
+}
+
+#endif /* CONFIG_DAC_TAS58XX */
 
 /* Enough for 15 filters worth of JSON with room for whitespace. */
 #define BQ_POST_MAX 6144
 
 static esp_err_t bq_page_handler(httpd_req_t *req) {
   return serve_spiffs_file(req, "/spiffs/www/bq.html", "text/html");
-}
-
-/* Which amplifier a chain belongs to, so the page can label the columns
- * without duplicating the dual-DAC wiring logic. */
-static const char *bq_amp_role(int dev) {
-  if (dev == 0) {
-    return "stereo";
-  }
-  return dac_tas58xx_get_active_second_pbtl() ? "mono" : "stereo";
 }
 
 static cJSON *bq_to_json(const tas58xx_bq_t *bq) {
@@ -1904,41 +2840,64 @@ static bool bq_from_json(const cJSON *o, tas58xx_bq_t *out) {
 }
 
 static esp_err_t bq_get_handler(httpd_req_t *req) {
-  const int devices = dac_tas58xx_get_device_count();
+  const int devices = eqb_devices();
 
   cJSON *json = cJSON_CreateObject();
   cJSON_AddBoolToObject(json, "success", true);
   cJSON_AddNumberToObject(json, "devices", devices);
-  cJSON_AddNumberToObject(json, "channels", TAS58XX_BQ_CHANNELS);
-  cJSON_AddNumberToObject(json, "slots", TAS58XX_BQ_SLOTS);
-  cJSON_AddNumberToObject(json, "rate", dac_tas58xx_bq_sample_rate());
-  cJSON_AddNumberToObject(json, "gain_min", TAS58XX_GAIN_MIN_DB);
-  cJSON_AddNumberToObject(json, "gain_max", TAS58XX_GAIN_MAX_DB);
+  cJSON_AddNumberToObject(json, "channels", EQB_CHANNELS);
+  cJSON_AddNumberToObject(json, "slots", EQB_SLOTS);
+  /* Retain the primary rate for clients predating per-amplifier rates. */
+  cJSON_AddNumberToObject(json, "rate", eqb_rate(0));
+  cJSON_AddNumberToObject(json, "gain_min", EQB_GAIN_MIN_DB);
+  cJSON_AddNumberToObject(json, "gain_max", EQB_GAIN_MAX_DB);
+  float preamp_db;
+  if (eqb_preamp_db(&preamp_db)) {
+    cJSON_AddNumberToObject(json, "preamp_db", preamp_db);
+  }
+#ifdef CONFIG_SOFTWARE_EQ_AB
+  /* Present only where the switch works. Not preamp_db, which would tell
+   * the page the board has no DSP. */
+  if (eq_ab_available()) {
+    cJSON_AddBoolToObject(json, "software_ab", eq_ab_get());
+  }
+#endif
+
+  /* Per I2S slot, so the board's rather than one amplifier's. */
+  cJSON *delay = cJSON_AddObjectToObject(json, "delay");
+  cJSON_AddBoolToObject(delay, "supported", audio_output_delay_supported());
+  cJSON_AddNumberToObject(delay, "max_us", AUDIO_DELAY_MAX_US);
+  cJSON *delay_us = cJSON_AddArrayToObject(delay, "us");
+  for (int c = 0; c < AUDIO_DELAY_CHANNELS; c++) {
+    cJSON_AddItemToArray(delay_us,
+                         cJSON_CreateNumber(audio_output_get_delay_us(c)));
+  }
 
   cJSON *amps = cJSON_AddArrayToObject(json, "amps");
   for (int d = 0; d < devices; d++) {
     cJSON *amp = cJSON_CreateObject();
     cJSON_AddNumberToObject(amp, "index", d);
-    cJSON_AddStringToObject(amp, "role", bq_amp_role(d));
-    cJSON_AddBoolToObject(amp, "ganged", dac_tas58xx_bq_get_ganged(d));
-    cJSON_AddNumberToObject(amp, "mix", dac_tas58xx_get_mix(d));
-    cJSON_AddBoolToObject(amp, "pbtl", dac_tas58xx_is_pbtl(d));
+    cJSON_AddNumberToObject(amp, "rate", eqb_rate(d));
+    cJSON_AddStringToObject(amp, "role", eqb_role(d));
+    cJSON_AddBoolToObject(amp, "ganged", eqb_get_ganged(d));
+    cJSON_AddNumberToObject(amp, "mix", eqb_get_mix(d));
+    cJSON_AddBoolToObject(amp, "pbtl", eqb_pbtl(d));
+    /* A TAS5805M cannot route its inputs, so it has only the one routing. */
+    cJSON_AddBoolToObject(amp, "mix_fixed", !eqb_can_route(d));
 
     cJSON *gains = cJSON_AddArrayToObject(amp, "gains");
     cJSON *mutes = cJSON_AddArrayToObject(amp, "mutes");
-    for (int c = 0; c < TAS58XX_BQ_CHANNELS; c++) {
-      cJSON_AddItemToArray(gains,
-                           cJSON_CreateNumber(dac_tas58xx_get_gain_db(d, c)));
-      cJSON_AddItemToArray(mutes,
-                           cJSON_CreateBool(dac_tas58xx_get_ch_mute(d, c)));
+    for (int c = 0; c < EQB_CHANNELS; c++) {
+      cJSON_AddItemToArray(gains, cJSON_CreateNumber(eqb_get_gain(d, c)));
+      cJSON_AddItemToArray(mutes, cJSON_CreateBool(eqb_get_mute(d, c)));
     }
 
     cJSON *chans = cJSON_AddArrayToObject(amp, "channels");
-    for (int c = 0; c < TAS58XX_BQ_CHANNELS; c++) {
-      tas58xx_bq_t chain[TAS58XX_BQ_SLOTS];
+    for (int c = 0; c < EQB_CHANNELS; c++) {
+      tas58xx_bq_t chain[EQB_SLOTS];
       cJSON *slots = cJSON_CreateArray();
-      if (dac_tas58xx_bq_get(d, c, chain)) {
-        for (int i = 0; i < TAS58XX_BQ_SLOTS; i++) {
+      if (eqb_get_chain(d, c, chain)) {
+        for (int i = 0; i < EQB_SLOTS; i++) {
           cJSON_AddItemToArray(slots, bq_to_json(&chain[i]));
         }
       }
@@ -1974,8 +2933,64 @@ static esp_err_t bq_post_handler(httpd_req_t *req) {
     return ESP_FAIL;
   }
 
+#ifdef CONFIG_SOFTWARE_EQ_AB
+  /* Which side plays the chains is the board's, not one amplifier's, so it
+   * needs no 'dev' when sent alone. */
+  const cJSON *ab = cJSON_GetObjectItem(json, "software_ab");
+  if (ab) {
+    if (!cJSON_IsBool(ab) || eq_ab_set(cJSON_IsTrue(ab)) != ESP_OK) {
+      cJSON_Delete(json);
+      httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                          "The software EQ cannot stand in here");
+      return ESP_FAIL;
+    }
+    if (!cJSON_GetObjectItem(json, "dev")) {
+      cJSON_Delete(json);
+      httpd_resp_set_type(req, "application/json");
+      httpd_resp_sendstr(req, "{\"success\":true}");
+      return ESP_OK;
+    }
+  }
+#endif
+
+  /* A delay holds back an I2S slot, which is the board's, so like the
+   * switch above it needs no 'dev' when sent alone. Saved at once, as the
+   * levels are. */
+  const cJSON *dly = cJSON_GetObjectItem(json, "delay_us");
+  if (dly) {
+    const cJSON *oc = cJSON_GetObjectItem(json, "out");
+    if (!json_int_in_range(oc, 0, AUDIO_DELAY_CHANNELS - 1) ||
+        !json_int_in_range(dly, 0, AUDIO_DELAY_MAX_US)) {
+      cJSON_Delete(json);
+      httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                          "Bad 'out' or 'delay_us'");
+      return ESP_FAIL;
+    }
+    /* 0 is always accepted, so a delay can be cleared on any layout. */
+    if (dly->valueint != 0 && !audio_output_delay_supported()) {
+      cJSON_Delete(json);
+      httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                          "This layout cannot delay one output on its own");
+      return ESP_FAIL;
+    }
+    if (audio_output_set_delay_us(oc->valueint, (uint32_t)dly->valueint) !=
+            ESP_OK &&
+        dly->valueint != 0) {
+      cJSON_Delete(json);
+      httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
+                          "Could not save the delay");
+      return ESP_FAIL;
+    }
+    if (!cJSON_GetObjectItem(json, "dev")) {
+      cJSON_Delete(json);
+      httpd_resp_set_type(req, "application/json");
+      httpd_resp_sendstr(req, "{\"success\":true}");
+      return ESP_OK;
+    }
+  }
+
   const cJSON *v = cJSON_GetObjectItem(json, "dev");
-  if (!json_int_in_range(v, 0, dac_tas58xx_get_device_count() - 1)) {
+  if (!json_int_in_range(v, 0, eqb_devices() - 1)) {
     cJSON_Delete(json);
     httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Bad 'dev'");
     return ESP_FAIL;
@@ -1986,7 +3001,7 @@ static esp_err_t bq_post_handler(httpd_req_t *req) {
    * the driver mirrors it when programming. */
   const cJSON *g = cJSON_GetObjectItem(json, "ganged");
   if (cJSON_IsBool(g)) {
-    dac_tas58xx_bq_set_ganged(dev, cJSON_IsTrue(g));
+    eqb_set_ganged(dev, cJSON_IsTrue(g));
   }
 
   /* Level and mute are per output rather than per chain, so they ride along
@@ -1995,7 +3010,7 @@ static esp_err_t bq_post_handler(httpd_req_t *req) {
   const cJSON *mute = cJSON_GetObjectItem(json, "mute");
   if (gain || mute) {
     const cJSON *oc = cJSON_GetObjectItem(json, "out");
-    if (!json_int_in_range(oc, 0, TAS58XX_BQ_CHANNELS - 1)) {
+    if (!json_int_in_range(oc, 0, EQB_CHANNELS - 1)) {
       cJSON_Delete(json);
       httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Bad 'out'");
       return ESP_FAIL;
@@ -2011,60 +3026,48 @@ static esp_err_t bq_post_handler(httpd_req_t *req) {
       return ESP_FAIL;
     }
     if (gain) {
-      dac_tas58xx_set_gain_db(dev, oc->valueint, (float)gain->valuedouble);
-      float saved[SETTINGS_AMP_OUTPUTS];
-      for (int i = 0; i < SETTINGS_AMP_OUTPUTS; i++) {
-        saved[i] = dac_tas58xx_get_gain_db(i / SETTINGS_AMP_CHANNELS,
-                                           i % SETTINGS_AMP_CHANNELS);
-      }
-      settings_set_amp_gain(saved);
+      eqb_set_gain(dev, oc->valueint, (float)gain->valuedouble);
     }
     if (mute) {
-      dac_tas58xx_set_ch_mute(dev, oc->valueint, cJSON_IsTrue(mute));
-      uint8_t saved[SETTINGS_AMP_OUTPUTS];
-      for (int i = 0; i < SETTINGS_AMP_OUTPUTS; i++) {
-        saved[i] = dac_tas58xx_get_ch_mute(i / SETTINGS_AMP_CHANNELS,
-                                           i % SETTINGS_AMP_CHANNELS);
-      }
-      settings_set_amp_mute(saved);
+      eqb_set_mute(dev, oc->valueint, cJSON_IsTrue(mute));
     }
   }
 
   const cJSON *mix = cJSON_GetObjectItem(json, "mix");
   if (mix) {
-    if (!json_int_in_range(mix, 0, TAS58XX_MIX_COUNT - 1)) {
+    if (!json_int_in_range(mix, 0, EQB_MIX_COUNT - 1)) {
       cJSON_Delete(json);
       httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Bad 'mix'");
       return ESP_FAIL;
     }
-    dac_tas58xx_set_mix(dev, (tas58xx_mix_t)mix->valueint);
-    uint8_t saved[SETTINGS_AMPS];
-    for (int i = 0; i < SETTINGS_AMPS; i++) {
-      saved[i] = (uint8_t)dac_tas58xx_get_mix(i);
+    if (mix->valueint != EQB_MIX_STEREO && !eqb_can_route(dev)) {
+      cJSON_Delete(json);
+      httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                          "This amplifier cannot route its inputs");
+      return ESP_FAIL;
     }
-    settings_set_amp_mix(saved);
+    eqb_set_mix(dev, mix->valueint);
   }
 
   const cJSON *filters = cJSON_GetObjectItem(json, "filters");
   if (filters) {
     v = cJSON_GetObjectItem(json, "ch");
-    if (!json_int_in_range(v, 0, TAS58XX_BQ_CHANNELS - 1)) {
+    if (!json_int_in_range(v, 0, EQB_CHANNELS - 1)) {
       cJSON_Delete(json);
       httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Bad 'ch'");
       return ESP_FAIL;
     }
     const int ch = v->valueint;
 
-    if (!cJSON_IsArray(filters) ||
-        cJSON_GetArraySize(filters) != TAS58XX_BQ_SLOTS) {
+    if (!cJSON_IsArray(filters) || cJSON_GetArraySize(filters) != EQB_SLOTS) {
       cJSON_Delete(json);
       httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
                           "'filters' must hold 15 entries");
       return ESP_FAIL;
     }
 
-    tas58xx_bq_t chain[TAS58XX_BQ_SLOTS];
-    for (int i = 0; i < TAS58XX_BQ_SLOTS; i++) {
+    tas58xx_bq_t chain[EQB_SLOTS];
+    for (int i = 0; i < EQB_SLOTS; i++) {
       if (!bq_from_json(cJSON_GetArrayItem(filters, i), &chain[i])) {
         cJSON_Delete(json);
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Bad filter entry");
@@ -2072,7 +3075,19 @@ static esp_err_t bq_post_handler(httpd_req_t *req) {
       }
     }
 
-    if (dac_tas58xx_bq_set(dev, ch, chain) != ESP_OK) {
+    for (int i = 0; i < EQB_SLOTS; i++) {
+      const char *why = NULL;
+      if (!eqb_check(&chain[i], &why)) {
+        char msg[96];
+        snprintf(msg, sizeof(msg), "Filter %d: %s", i + 1,
+                 why ? why : "rejected");
+        cJSON_Delete(json);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, msg);
+        return ESP_FAIL;
+      }
+    }
+
+    if (eqb_set_chain(dev, ch, chain) != ESP_OK) {
       cJSON_Delete(json);
       httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Filter rejected");
       return ESP_FAIL;
@@ -2080,15 +3095,22 @@ static esp_err_t bq_post_handler(httpd_req_t *req) {
   }
 
   cJSON_Delete(json);
+  /* The preamp follows every change, so hand it back for the page to show. */
+  char resp[48] = "{\"success\":true}";
+  float preamp_db;
+  if (eqb_preamp_db(&preamp_db)) {
+    snprintf(resp, sizeof(resp), "{\"success\":true,\"preamp_db\":%.1f}",
+             (double)preamp_db);
+  }
   httpd_resp_set_type(req, "application/json");
-  httpd_resp_sendstr(req, "{\"success\":true}");
+  httpd_resp_sendstr(req, resp);
   return ESP_OK;
 }
 
 /* Chain edits stay in RAM until committed, matching the hybrid-flow pages:
  * a tuning can be auditioned and walked away from by rebooting. */
 static esp_err_t bq_commit_handler(httpd_req_t *req) {
-  if (dac_tas58xx_bq_commit() != ESP_OK) {
+  if (eqb_commit() != ESP_OK) {
     httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Write failed");
     return ESP_FAIL;
   }
@@ -2098,7 +3120,7 @@ static esp_err_t bq_commit_handler(httpd_req_t *req) {
 }
 
 static esp_err_t bq_revert_handler(httpd_req_t *req) {
-  if (dac_tas58xx_bq_revert() != ESP_OK) {
+  if (eqb_revert() != ESP_OK) {
     httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Revert failed");
     return ESP_FAIL;
   }
@@ -2107,7 +3129,120 @@ static esp_err_t bq_revert_handler(httpd_req_t *req) {
   return ESP_OK;
 }
 
-#endif /* CONFIG_DAC_TAS58XX */
+#ifdef CONFIG_DAC_TAS58XX
+static void add_block_hex(cJSON *arr,
+                          const uint8_t block[TAS58XX_BQ_COEFF_BYTES]) {
+  char hex[TAS58XX_BQ_COEFF_BYTES * 2 + 1];
+  for (int i = 0; i < TAS58XX_BQ_COEFF_BYTES; i++) {
+    snprintf(&hex[i * 2], 3, "%02x", block[i]);
+  }
+  cJSON_AddItemToArray(arr, cJSON_CreateString(hex));
+}
+
+/* A DSP word as the chip holds it, and its value at @p frac_bits. */
+static void add_coeff(cJSON *obj, const char *name, int32_t raw,
+                      int frac_bits) {
+  cJSON *c = cJSON_AddObjectToObject(obj, name);
+  char hex[9];
+  snprintf(hex, sizeof(hex), "%08lx", (unsigned long)(uint32_t)raw);
+  cJSON_AddStringToObject(c, "raw", hex);
+  const double v = ldexp((double)raw, -frac_bits);
+  cJSON_AddNumberToObject(c, "value", v);
+  if (v > 0.0) {
+    cJSON_AddNumberToObject(c, "db", 20.0 * log10(v));
+  }
+}
+
+/* The amplifier's limiter and clipper, which the driver leaves as it finds
+ * them. Only the TAS5805M's map is known here. */
+static void add_limits(cJSON *amp, int dev) {
+  tas58xx_limit_readback_t lim;
+  if (dac_tas58xx_limit_readback(dev, &lim) != ESP_OK) {
+    return;
+  }
+  /* TI's note lists Enable as non-zero yet calls the AGL off by default, so
+   * the flag is shown as read rather than as on or off. */
+  cJSON *agl = cJSON_AddObjectToObject(amp, "agl");
+  add_coeff(agl, "enable", lim.agl_enable, 31);
+  add_coeff(agl, "threshold", lim.agl_threshold, 31);
+  add_coeff(agl, "attack", lim.agl_attack, 31);
+  add_coeff(agl, "release", lim.agl_release, 31);
+  add_coeff(agl, "alpha", lim.agl_alpha, 31);
+  add_coeff(agl, "omega", lim.agl_omega, 31);
+  cJSON *clip = cJSON_AddObjectToObject(amp, "clipper");
+  add_coeff(clip, "thd_boost", lim.thd_boost, 23);
+  add_coeff(clip, "fine_volume_l", lim.fine_vol[0], 30);
+  add_coeff(clip, "fine_volume_r", lim.fine_vol[1], 30);
+}
+
+/* Each section as designed next to what the part's coefficient RAM holds, so
+ * a chain can be checked end to end. A mismatch only means something while
+ * the amplifier is playing, which is when the chain is written. */
+static esp_err_t bq_readback_handler(httpd_req_t *req) {
+  static const char *const states[] = {"deep sleep", "sleep", "hi-z", "play"};
+  tas58xx_bq_readback_t *rb = malloc(sizeof(*rb));
+  if (!rb) {
+    httpd_resp_send_500(req);
+    return ESP_FAIL;
+  }
+
+  cJSON *json = cJSON_CreateObject();
+  int total = 0;
+  bool ok = true;
+  cJSON *amps = cJSON_AddArrayToObject(json, "amps");
+  for (int d = 0; d < eqb_devices() && ok; d++) {
+    cJSON *amp = cJSON_CreateObject();
+    cJSON_AddNumberToObject(amp, "index", d);
+    cJSON *chans = cJSON_AddArrayToObject(amp, "channels");
+    for (int c = 0; c < EQB_CHANNELS && ok; c++) {
+      if (dac_tas58xx_bq_readback(d, c, rb) != ESP_OK) {
+        ok = false;
+        break;
+      }
+      if (c == 0) {
+        cJSON_AddStringToObject(amp, "state", states[rb->ctrl2 & 0x03]);
+        cJSON_AddBoolToObject(amp, "muted", (rb->ctrl2 & 0x08) != 0);
+        cJSON_AddBoolToObject(amp, "eq_bypassed", rb->eq_bypassed);
+        cJSON_AddNumberToObject(amp, "rate", rb->design_rate_hz);
+        add_limits(amp, d);
+      }
+      cJSON *ch = cJSON_CreateObject();
+      cJSON *mismatched = cJSON_AddArrayToObject(ch, "mismatched");
+      cJSON *expected = cJSON_AddArrayToObject(ch, "expected");
+      cJSON *actual = cJSON_AddArrayToObject(ch, "actual");
+      for (int i = 0; i < EQB_SLOTS; i++) {
+        add_block_hex(expected, rb->expected[i]);
+        add_block_hex(actual, rb->actual[i]);
+        if (memcmp(rb->expected[i], rb->actual[i], TAS58XX_BQ_COEFF_BYTES)) {
+          cJSON_AddItemToArray(mismatched, cJSON_CreateNumber(i));
+          total++;
+        }
+      }
+      cJSON_AddItemToArray(chans, ch);
+    }
+    cJSON_AddItemToArray(amps, amp);
+  }
+  free(rb);
+  cJSON_AddBoolToObject(json, "success", ok);
+  cJSON_AddNumberToObject(json, "mismatches", total);
+
+  char *json_str = cJSON_PrintUnformatted(json);
+  cJSON_Delete(json);
+  if (!json_str) {
+    httpd_resp_send_500(req);
+    return ESP_FAIL;
+  }
+  httpd_resp_set_type(req, "application/json");
+  if (!ok) {
+    httpd_resp_set_status(req, HTTPD_500);
+  }
+  httpd_resp_send(req, json_str, HTTPD_RESP_USE_STRLEN);
+  free(json_str);
+  return ESP_OK;
+}
+#endif
+
+#endif /* HAS_BQ_API */
 
 esp_err_t web_server_start(uint16_t port) {
   if (s_server) {
@@ -2127,7 +3262,14 @@ esp_err_t web_server_start(uint16_t port) {
   // Slots are allocated up front and httpd_register_uri_handler failures are
   // unchecked, so an undercount silently drops whatever registers last, which
   // is log_stream's /ws/logs. Keep these in step with the handlers below.
-  config.max_uri_handlers = 38; // 32 here + /ws/logs, plus 5 spare
+  config.max_uri_handlers = 43; // 37 here + /ws/logs, plus 5 spare
+#ifdef CONFIG_SENDSPIN_ENABLE
+  config.max_uri_handlers += 5; // /sendspin + mode get/post + unpair + reset
+  // The Sendspin server holds its WebSocket open for as long as the speaker
+  // exists, so it permanently occupies a slot that the web UI would otherwise
+  // reuse.  Without this, opening the config page evicts the audio session.
+  config.max_open_sockets += 2;
+#endif
 #ifdef DAC_HAS_SUB_OFFSET
   config.max_uri_handlers += 2; // sub level get/post
 #endif
@@ -2135,14 +3277,31 @@ esp_err_t web_server_start(uint16_t port) {
   config.max_uri_handlers += 2; // per-channel level get/post
 #endif
 #ifdef CONFIG_DAC_TAS58XX
-  // dual DAC wiring plus the biquad page/API
+  // primary + dual DAC wiring and digital gain, get/post each, and the
+  // biquad readback
   config.max_uri_handlers += 7;
+#endif
+#ifdef HAS_BQ_API
+  config.max_uri_handlers += 5; // biquad page + get/post/commit/revert
+#endif
+#ifdef CONFIG_HUSB238A
+  config.max_uri_handlers += 2; // USB-PD supply get/post
 #endif
 #ifdef CONFIG_DAC_TAS57XX
   config.max_uri_handlers += 11; // tuning page + HF1/HF3 get/post/commit/revert
 #endif
   config.max_resp_headers = 8;
+#ifdef CONFIG_SENDSPIN_OPUS
+  /* libopus keeps its CELT scratch on the stack: measured peak is 11.7 KB at
+   * 48 kHz stereo, on top of what serving a request already needs. */
+  config.stack_size = 16384;
+#else
   config.stack_size = 8192;
+#endif
+
+  if (!s_boot_name[0]) {
+    settings_get_device_name(s_boot_name, sizeof(s_boot_name));
+  }
 
   esp_err_t err = httpd_start(&s_server, &config);
   if (err != ESP_OK) {
@@ -2150,274 +3309,341 @@ esp_err_t web_server_start(uint16_t port) {
     return err;
   }
 
-  // Register handlers
-  httpd_uri_t root_uri = {
-      .uri = "/", .method = HTTP_GET, .handler = root_handler};
-  httpd_register_uri_handler(s_server, &root_uri);
+  // Register handlers (a restarted server registers them all again)
+  s_api_handler_count = 0;
+  for (size_t i = 0; i < sizeof(STATIC_FILES) / sizeof(STATIC_FILES[0]); i++) {
+    httpd_uri_t file_uri = {.uri = STATIC_FILES[i].uri,
+                            .method = HTTP_GET,
+                            .handler = static_file_handler,
+                            .user_ctx = (void *)&STATIC_FILES[i]};
+    register_uri(&file_uri);
+  }
 
   httpd_uri_t favicon_uri = {
       .uri = "/favicon.ico", .method = HTTP_GET, .handler = favicon_handler};
-  httpd_register_uri_handler(s_server, &favicon_uri);
-
-  httpd_uri_t logs_uri = {
-      .uri = "/logs", .method = HTTP_GET, .handler = logs_page_handler};
-  httpd_register_uri_handler(s_server, &logs_uri);
-
-  httpd_uri_t speedtest_page_uri = {.uri = "/speedtest",
-                                    .method = HTTP_GET,
-                                    .handler = speedtest_page_handler};
-  httpd_register_uri_handler(s_server, &speedtest_page_uri);
+  register_uri(&favicon_uri);
 
   httpd_uri_t speedtest_ping_uri = {.uri = "/api/speedtest/ping",
                                     .method = HTTP_GET,
                                     .handler = speedtest_ping_handler};
-  httpd_register_uri_handler(s_server, &speedtest_ping_uri);
+  register_uri(&speedtest_ping_uri);
 
   httpd_uri_t speedtest_dl_uri = {.uri = "/api/speedtest/download",
                                   .method = HTTP_GET,
                                   .handler = speedtest_download_handler};
-  httpd_register_uri_handler(s_server, &speedtest_dl_uri);
+  register_uri(&speedtest_dl_uri);
 
   httpd_uri_t speedtest_ul_uri = {.uri = "/api/speedtest/upload",
                                   .method = HTTP_POST,
                                   .handler = speedtest_upload_handler};
-  httpd_register_uri_handler(s_server, &speedtest_ul_uri);
+  register_uri(&speedtest_ul_uri);
 
   httpd_uri_t wifi_scan_uri = {.uri = "/api/wifi/scan",
                                .method = HTTP_GET,
                                .handler = wifi_scan_handler};
-  httpd_register_uri_handler(s_server, &wifi_scan_uri);
+  register_uri(&wifi_scan_uri);
 
   httpd_uri_t wifi_config_uri = {.uri = "/api/wifi/config",
                                  .method = HTTP_POST,
                                  .handler = wifi_config_handler};
-  httpd_register_uri_handler(s_server, &wifi_config_uri);
+  register_uri(&wifi_config_uri);
 
   httpd_uri_t device_name_uri = {.uri = "/api/device/name",
                                  .method = HTTP_POST,
                                  .handler = device_name_handler};
-  httpd_register_uri_handler(s_server, &device_name_uri);
+  register_uri(&device_name_uri);
 
   httpd_uri_t led_brightness_get_uri = {.uri = "/api/led/brightness",
                                         .method = HTTP_GET,
                                         .handler = led_brightness_get_handler};
-  httpd_register_uri_handler(s_server, &led_brightness_get_uri);
+  register_uri(&led_brightness_get_uri);
 
   httpd_uri_t led_brightness_post_uri = {.uri = "/api/led/brightness",
                                          .method = HTTP_POST,
                                          .handler =
                                              led_brightness_post_handler};
-  httpd_register_uri_handler(s_server, &led_brightness_post_uri);
+  register_uri(&led_brightness_post_uri);
 
   httpd_uri_t channel_mode_get_uri = {.uri = "/api/audio/channel",
                                       .method = HTTP_GET,
                                       .handler = channel_mode_get_handler};
-  httpd_register_uri_handler(s_server, &channel_mode_get_uri);
+  register_uri(&channel_mode_get_uri);
 
   httpd_uri_t channel_mode_post_uri = {.uri = "/api/audio/channel",
                                        .method = HTTP_POST,
                                        .handler = channel_mode_post_handler};
-  httpd_register_uri_handler(s_server, &channel_mode_post_uri);
+  register_uri(&channel_mode_post_uri);
 
   httpd_uri_t volume_get_uri = {.uri = "/api/audio/volume",
                                 .method = HTTP_GET,
                                 .handler = volume_get_handler};
-  httpd_register_uri_handler(s_server, &volume_get_uri);
+  register_uri(&volume_get_uri);
 
   httpd_uri_t volume_post_uri = {.uri = "/api/audio/volume",
                                  .method = HTTP_POST,
                                  .handler = volume_post_handler};
-  httpd_register_uri_handler(s_server, &volume_post_uri);
+  register_uri(&volume_post_uri);
 
 #ifdef DAC_HAS_SUB_OFFSET
   httpd_uri_t sub_offset_get_uri = {.uri = "/api/audio/sub",
                                     .method = HTTP_GET,
                                     .handler = sub_offset_get_handler};
-  httpd_register_uri_handler(s_server, &sub_offset_get_uri);
+  register_uri(&sub_offset_get_uri);
 
   httpd_uri_t sub_offset_post_uri = {.uri = "/api/audio/sub",
                                      .method = HTTP_POST,
                                      .handler = sub_offset_post_handler};
-  httpd_register_uri_handler(s_server, &sub_offset_post_uri);
+  register_uri(&sub_offset_post_uri);
 #endif
 
 #ifdef DAC_HAS_CH_TRIM
   httpd_uri_t ch_trim_get_uri = {.uri = "/api/audio/channels",
                                  .method = HTTP_GET,
                                  .handler = ch_trim_get_handler};
-  httpd_register_uri_handler(s_server, &ch_trim_get_uri);
+  register_uri(&ch_trim_get_uri);
 
   httpd_uri_t ch_trim_post_uri = {.uri = "/api/audio/channels",
                                   .method = HTTP_POST,
                                   .handler = ch_trim_post_handler};
-  httpd_register_uri_handler(s_server, &ch_trim_post_uri);
+  register_uri(&ch_trim_post_uri);
 #endif
 
 #ifdef CONFIG_DAC_TAS58XX
+  httpd_uri_t pbtl_get_uri = {.uri = "/api/audio/pbtl",
+                              .method = HTTP_GET,
+                              .handler = pbtl_get_handler};
+  register_uri(&pbtl_get_uri);
+
+  httpd_uri_t pbtl_post_uri = {.uri = "/api/audio/pbtl",
+                               .method = HTTP_POST,
+                               .handler = pbtl_post_handler};
+  register_uri(&pbtl_post_uri);
+
   httpd_uri_t dual_mode_get_uri = {.uri = "/api/audio/dual",
                                    .method = HTTP_GET,
                                    .handler = dual_mode_get_handler};
-  httpd_register_uri_handler(s_server, &dual_mode_get_uri);
+  register_uri(&dual_mode_get_uri);
 
   httpd_uri_t dual_mode_post_uri = {.uri = "/api/audio/dual",
                                     .method = HTTP_POST,
                                     .handler = dual_mode_post_handler};
-  httpd_register_uri_handler(s_server, &dual_mode_post_uri);
+  register_uri(&dual_mode_post_uri);
+
+  httpd_uri_t digital_gain_get_uri = {.uri = "/api/audio/digital-gain",
+                                      .method = HTTP_GET,
+                                      .handler = digital_gain_get_handler};
+  register_uri(&digital_gain_get_uri);
+
+  httpd_uri_t digital_gain_post_uri = {.uri = "/api/audio/digital-gain",
+                                       .method = HTTP_POST,
+                                       .handler = digital_gain_post_handler};
+  register_uri(&digital_gain_post_uri);
+#endif
+
+#ifdef CONFIG_HUSB238A
+  httpd_uri_t usb_pd_get_uri = {.uri = "/api/power/usb-pd",
+                                .method = HTTP_GET,
+                                .handler = usb_pd_get_handler};
+  register_uri(&usb_pd_get_uri);
+
+  httpd_uri_t usb_pd_post_uri = {.uri = "/api/power/usb-pd",
+                                 .method = HTTP_POST,
+                                 .handler = usb_pd_post_handler};
+  register_uri(&usb_pd_post_uri);
 #endif
 
   httpd_uri_t airplay_mode_get_uri = {.uri = "/api/airplay/mode",
                                       .method = HTTP_GET,
                                       .handler = airplay_mode_get_handler};
-  httpd_register_uri_handler(s_server, &airplay_mode_get_uri);
+  register_uri(&airplay_mode_get_uri);
 
   httpd_uri_t airplay_mode_post_uri = {.uri = "/api/airplay/mode",
                                        .method = HTTP_POST,
                                        .handler = airplay_mode_post_handler};
-  httpd_register_uri_handler(s_server, &airplay_mode_post_uri);
+  register_uri(&airplay_mode_post_uri);
 
   httpd_uri_t ota_uri = {.uri = "/api/ota/update",
                          .method = HTTP_POST,
                          .handler = ota_update_handler};
-  httpd_register_uri_handler(s_server, &ota_uri);
+  register_uri(&ota_uri);
 
   httpd_uri_t metadata_uri = {.uri = "/api/metadata",
                               .method = HTTP_POST,
                               .handler = metadata_post_handler};
-  httpd_register_uri_handler(s_server, &metadata_uri);
+  register_uri(&metadata_uri);
+
+  httpd_uri_t status_uri = {
+      .uri = "/api/status", .method = HTTP_GET, .handler = status_handler};
+  register_uri(&status_uri);
 
   httpd_uri_t system_info_uri = {.uri = "/api/system/info",
                                  .method = HTTP_GET,
                                  .handler = system_info_handler};
-  httpd_register_uri_handler(s_server, &system_info_uri);
+  register_uri(&system_info_uri);
 
   httpd_uri_t system_restart_uri = {.uri = "/api/system/restart",
                                     .method = HTTP_POST,
                                     .handler = system_restart_handler};
-  httpd_register_uri_handler(s_server, &system_restart_uri);
+  register_uri(&system_restart_uri);
+
+#ifdef CONFIG_SENDSPIN_ENABLE
+  httpd_uri_t sendspin_mode_get_uri = {.uri = "/api/sendspin/mode",
+                                       .method = HTTP_GET,
+                                       .handler = sendspin_mode_get_handler};
+  register_uri(&sendspin_mode_get_uri);
+
+  httpd_uri_t sendspin_mode_post_uri = {.uri = "/api/sendspin/mode",
+                                        .method = HTTP_POST,
+                                        .handler = sendspin_mode_post_handler};
+  register_uri(&sendspin_mode_post_uri);
+
+  httpd_uri_t sendspin_unpair_uri = {.uri = "/api/sendspin/unpair",
+                                     .method = HTTP_POST,
+                                     .handler = sendspin_unpair_handler};
+  register_uri(&sendspin_unpair_uri);
+
+  httpd_uri_t sendspin_reset_identity_uri = {
+      .uri = "/api/sendspin/reset-identity",
+      .method = HTTP_POST,
+      .handler = sendspin_reset_identity_handler};
+  register_uri(&sendspin_reset_identity_uri);
+#endif
 
   // File management API
   httpd_uri_t fs_upload_uri = {.uri = "/api/fs/upload",
                                .method = HTTP_POST,
                                .handler = fs_upload_handler};
-  httpd_register_uri_handler(s_server, &fs_upload_uri);
+  register_uri(&fs_upload_uri);
 
   httpd_uri_t fs_delete_uri = {.uri = "/api/fs/delete",
                                .method = HTTP_POST,
                                .handler = fs_delete_handler};
-  httpd_register_uri_handler(s_server, &fs_delete_uri);
+  register_uri(&fs_delete_uri);
 
   httpd_uri_t fs_list_uri = {
       .uri = "/api/fs/list", .method = HTTP_GET, .handler = fs_list_handler};
-  httpd_register_uri_handler(s_server, &fs_list_uri);
+  register_uri(&fs_list_uri);
 
   httpd_uri_t fs_download_uri = {.uri = "/api/fs/download",
                                  .method = HTTP_GET,
                                  .handler = fs_download_handler};
-  httpd_register_uri_handler(s_server, &fs_download_uri);
+  register_uri(&fs_download_uri);
 
   // Captive portal detection endpoints
   // Apple iOS/macOS
   httpd_uri_t apple_captive1 = {.uri = "/hotspot-detect.html",
                                 .method = HTTP_GET,
                                 .handler = captive_apple_handler};
-  httpd_register_uri_handler(s_server, &apple_captive1);
+  register_uri(&apple_captive1);
 
   httpd_uri_t apple_captive2 = {.uri = "/library/test/success.html",
                                 .method = HTTP_GET,
                                 .handler = captive_apple_handler};
-  httpd_register_uri_handler(s_server, &apple_captive2);
+  register_uri(&apple_captive2);
 
   // Android
   httpd_uri_t android_captive = {.uri = "/generate_204",
                                  .method = HTTP_GET,
                                  .handler = captive_android_handler};
-  httpd_register_uri_handler(s_server, &android_captive);
+  register_uri(&android_captive);
 
   // Windows
   httpd_uri_t windows_captive = {.uri = "/connecttest.txt",
                                  .method = HTTP_GET,
                                  .handler = captive_windows_handler};
-  httpd_register_uri_handler(s_server, &windows_captive);
+  register_uri(&windows_captive);
   windows_captive.uri = "/redirect";
-  httpd_register_uri_handler(s_server, &windows_captive);
+  register_uri(&windows_captive);
 
-#ifdef CONFIG_DAC_TAS58XX
+#ifdef HAS_BQ_API
   httpd_uri_t bq_page_uri = {
       .uri = "/bq", .method = HTTP_GET, .handler = bq_page_handler};
-  httpd_register_uri_handler(s_server, &bq_page_uri);
+  register_uri(&bq_page_uri);
 
   httpd_uri_t bq_get_uri = {
       .uri = "/api/bq", .method = HTTP_GET, .handler = bq_get_handler};
-  httpd_register_uri_handler(s_server, &bq_get_uri);
+  register_uri(&bq_get_uri);
 
   httpd_uri_t bq_post_uri = {
       .uri = "/api/bq", .method = HTTP_POST, .handler = bq_post_handler};
-  httpd_register_uri_handler(s_server, &bq_post_uri);
+  register_uri(&bq_post_uri);
 
   httpd_uri_t bq_commit_uri = {.uri = "/api/bq/commit",
                                .method = HTTP_POST,
                                .handler = bq_commit_handler};
-  httpd_register_uri_handler(s_server, &bq_commit_uri);
+  register_uri(&bq_commit_uri);
 
   httpd_uri_t bq_revert_uri = {.uri = "/api/bq/revert",
                                .method = HTTP_POST,
                                .handler = bq_revert_handler};
-  httpd_register_uri_handler(s_server, &bq_revert_uri);
+  register_uri(&bq_revert_uri);
+
+#ifdef CONFIG_DAC_TAS58XX
+  httpd_uri_t bq_readback_uri = {.uri = "/api/bq/readback",
+                                 .method = HTTP_GET,
+                                 .handler = bq_readback_handler};
+  register_uri(&bq_readback_uri);
+#endif
 #endif
 
 #ifdef CONFIG_DAC_TAS57XX
   httpd_uri_t hf_page_uri = {
       .uri = "/hf", .method = HTTP_GET, .handler = hf_page_handler};
-  httpd_register_uri_handler(s_server, &hf_page_uri);
+  register_uri(&hf_page_uri);
 
   httpd_uri_t hf1_get_uri = {
       .uri = "/api/hf1", .method = HTTP_GET, .handler = hf1_get_handler};
-  httpd_register_uri_handler(s_server, &hf1_get_uri);
+  register_uri(&hf1_get_uri);
 
   httpd_uri_t hf1_post_uri = {
       .uri = "/api/hf1", .method = HTTP_POST, .handler = hf1_post_handler};
-  httpd_register_uri_handler(s_server, &hf1_post_uri);
+  register_uri(&hf1_post_uri);
 
   httpd_uri_t hf1_commit_uri = {.uri = "/api/hf1/commit",
                                 .method = HTTP_POST,
                                 .handler = hf1_commit_handler};
-  httpd_register_uri_handler(s_server, &hf1_commit_uri);
+  register_uri(&hf1_commit_uri);
 
   httpd_uri_t hf1_revert_uri = {.uri = "/api/hf1/revert",
                                 .method = HTTP_POST,
                                 .handler = hf1_revert_handler};
-  httpd_register_uri_handler(s_server, &hf1_revert_uri);
+  register_uri(&hf1_revert_uri);
 
   httpd_uri_t hf3_get_uri = {
       .uri = "/api/hf3", .method = HTTP_GET, .handler = hf3_get_handler};
-  httpd_register_uri_handler(s_server, &hf3_get_uri);
+  register_uri(&hf3_get_uri);
 
   httpd_uri_t hf3_post_uri = {
       .uri = "/api/hf3", .method = HTTP_POST, .handler = hf3_post_handler};
-  httpd_register_uri_handler(s_server, &hf3_post_uri);
+  register_uri(&hf3_post_uri);
 
   httpd_uri_t hf3_commit_uri = {.uri = "/api/hf3/commit",
                                 .method = HTTP_POST,
                                 .handler = hf3_commit_handler};
-  httpd_register_uri_handler(s_server, &hf3_commit_uri);
+  register_uri(&hf3_commit_uri);
 
   httpd_uri_t hf3_revert_uri = {.uri = "/api/hf3/revert",
                                 .method = HTTP_POST,
                                 .handler = hf3_revert_handler};
-  httpd_register_uri_handler(s_server, &hf3_revert_uri);
+  register_uri(&hf3_revert_uri);
 
   httpd_uri_t hf_flow_get_uri = {.uri = "/api/hf/flow",
                                  .method = HTTP_GET,
                                  .handler = hf_flow_get_handler};
-  httpd_register_uri_handler(s_server, &hf_flow_get_uri);
+  register_uri(&hf_flow_get_uri);
 
   httpd_uri_t hf_flow_post_uri = {.uri = "/api/hf/flow",
                                   .method = HTTP_POST,
                                   .handler = hf_flow_post_handler};
-  httpd_register_uri_handler(s_server, &hf_flow_post_uri);
+  register_uri(&hf_flow_post_uri);
 #endif
 
   log_stream_register(s_server);
+#ifdef CONFIG_SENDSPIN_ENABLE
+  // Returns ESP_ERR_INVALID_STATE when sendspin_init() was skipped, which is
+  // the disabled case rather than a failure.
+  sendspin_register(s_server);
+#endif
 
   ESP_LOGI(TAG, "Web server started on port %d with captive portal support",
            port);

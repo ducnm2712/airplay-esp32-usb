@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 airplay-esp32 contributors
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 /**
  * @file board.c
  * @brief Board implementation for the esparagus audio brick
@@ -19,11 +22,14 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "led.h"
-#include "rtsp_events.h"
+#include "playback_events.h"
 #include "settings.h"
 
 #if defined(CONFIG_ETH_W5500_ENABLED) || defined(CONFIG_DISPLAY_BUS_SPI)
 #include "driver/spi_master.h"
+#endif
+#ifdef CONFIG_HUSB238A
+#include "husb238a.h"
 #endif
 
 #define ISR_HANDLER_TASK_STACK_SIZE 4096
@@ -44,8 +50,9 @@ static i2c_master_bus_handle_t s_i2c_bus_handle = NULL;
 static bool s_spi_bus_initialized = false;
 #endif
 
-static void on_rtsp_event(rtsp_event_t event, const rtsp_event_data_t *data,
-                          void *user_data);
+static void on_playback_event(playback_source_t source, playback_event_t event,
+                              const playback_event_data_t *data,
+                              void *user_data);
 static esp_err_t init_spkfault_gpio(void);
 static esp_err_t init_dac_pdn_gpios(void);
 
@@ -186,6 +193,21 @@ esp_err_t iot_board_init(void) {
            BOARD_SPI_MOSI_GPIO, BOARD_SPI_MISO_GPIO, BOARD_SPI_CLK_GPIO);
 #endif
 
+#ifdef CONFIG_HUSB238A
+  /* Settle the amplifier's supply before the amplifier comes up. A board
+   * without the trigger (the 42 mm Louder-ESP32-Mini, say) does not answer
+   * at its address and stays on the 5 V every USB-C port gives. Left to
+   * itself the board takes the highest voltage the charger offers, and the
+   * driver hears every supply agreed, which an automatic gain follows. */
+  int pd_volts = CONFIG_HUSB238A_DEFAULT_VOLTS;
+  if (settings_get_usb_pd_auto()) {
+    pd_volts = CONFIG_HUSB238A_MAX_VOLTS;
+  } else {
+    settings_get_usb_pd_volts(&pd_volts);
+  }
+  husb238a_init(s_i2c_bus_handle, pd_volts, dac_tas58xx_set_supply_mv);
+#endif
+
   err = dac_init(s_i2c_bus_handle);
   if (err != ESP_OK) {
     ESP_LOGE(TAG, "Failed to initialize DAC: %s", esp_err_to_name(err));
@@ -193,7 +215,7 @@ esp_err_t iot_board_init(void) {
   }
 
   // Register for RTSP events to control DAC power
-  rtsp_events_register(on_rtsp_event, NULL);
+  playback_events_register(on_playback_event, NULL);
 
   // Configure speaker fault detection
   err = init_spkfault_gpio();
@@ -227,7 +249,7 @@ esp_err_t iot_board_deinit(void) {
     vTaskDelete(gpio_task_handle);
     gpio_task_handle = NULL;
   }
-  rtsp_events_unregister(on_rtsp_event);
+  playback_events_unregister(on_playback_event);
 
   dac_enable_speaker(false);
   dac_set_power_mode(DAC_POWER_OFF);
@@ -249,23 +271,25 @@ esp_err_t iot_board_deinit(void) {
   return ESP_OK;
 }
 
-static void on_rtsp_event(rtsp_event_t event, const rtsp_event_data_t *data,
-                          void *user_data) {
+static void on_playback_event(playback_source_t source, playback_event_t event,
+                              const playback_event_data_t *data,
+                              void *user_data) {
+  (void)source;
   (void)data;
   (void)user_data;
 
   switch (event) {
-  case RTSP_EVENT_CLIENT_CONNECTED:
-  case RTSP_EVENT_PAUSED:
+  case PLAYBACK_EVENT_CONNECTED:
+  case PLAYBACK_EVENT_PAUSED:
     dac_set_power_mode(DAC_POWER_STANDBY);
     break;
-  case RTSP_EVENT_PLAYING:
+  case PLAYBACK_EVENT_PLAYING:
     dac_set_power_mode(DAC_POWER_ON);
     break;
-  case RTSP_EVENT_DISCONNECTED:
+  case PLAYBACK_EVENT_DISCONNECTED:
     dac_set_power_mode(DAC_POWER_OFF);
     break;
-  case RTSP_EVENT_METADATA:
+  case PLAYBACK_EVENT_METADATA:
     break;
   }
 }

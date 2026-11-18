@@ -123,7 +123,7 @@ menu "Airplay ESP Configuration"
         string "Access Point Password"
         default ""
         help
-            Password used for the Access Point. Leave empty and set AUTH MODE to WIFI_AUTH_OPEN for no password.
+            Password used for the Access Point. Leave empty for an open AP. Otherwise 8-63 characters, or exactly 64 hex digits (WPA2); anything else is logged and the AP starts open.
 
     config DEFAULT_AP_CHANNEL
         int "Access Point WiFi Channel"
@@ -154,6 +154,15 @@ menu "Airplay ESP Configuration"
             for a more reliable link. Lower (more negative) values make the
             receiver stick to 5 GHz even at weak signal.
     endmenu
+
+    # Not user-visible: the log viewer's WebSocket turns other sites away
+    # before its handshake, which needs this hook. A select, unlike a line in
+    # sdkconfig.defaults, also reaches an existing sdkconfig.
+    config WEB_WS_ORIGIN_CHECK
+        bool
+        default y
+        depends on HTTPD_WS_SUPPORT
+        select HTTPD_WS_PRE_HANDSHAKE_CB_SUPPORT
 
     menu "Audio Output"
     choice AUDIO_OUTPUT_TYPE
@@ -199,6 +208,62 @@ menu "Airplay ESP Configuration"
                 negotiates (48 kHz target); AirPlay audio is resampled
                 automatically.
     endchoice
+
+    config SOFTWARE_EQ
+        bool "Software parametric EQ"
+        depends on AUDIO_OUTPUT_I2S && !DAC_TAS58XX && !DAC_TAS57XX
+        depends on SOC_CPU_HAS_FPU && SPIRAM
+        default n
+        help
+            Run the Biquad EQ page (/bq) on the ESP32 itself, for plain I2S
+            DACs and amplifiers (PCM5102A, MAX98357A, ...) that have no DSP
+            of their own: 15 sections per channel (peaking, shelves, high-
+            and low-pass, notch, ...) plus a level trim and mute per output.
+            Applies to AirPlay, Sendspin, USB and Bluetooth audio alike.
+
+            The filters run in single-precision floating point on the audio
+            task, so this needs a chip with an FPU (not the ESP32-S2 or
+            ESP32-C5), and the CPU it takes grows with the number of active
+            sections. Its tables live in PSRAM, so it needs that too.
+            Boosts play at full level, so a loud track can clip; the volume
+            is applied before the output is rounded, so turning it down
+            cures that.
+
+    config SOFTWARE_EQ_AB
+        bool "Software EQ A/B switch on a TAS58xx amplifier"
+        depends on AUDIO_OUTPUT_I2S && DAC_TAS58XX
+        depends on SOC_CPU_HAS_FPU && SPIRAM
+        default y
+        help
+            Add a switch to the Biquad EQ page (/bq) that plays the
+            amplifier's filters on the ESP32's software EQ instead of its
+            DSP, with the DSP's sections set flat and the level matched, so
+            a fault in the DSP path can be told by ear from one in the
+            tuning. The choice is saved. Only for a board with one
+            amplifier.
+
+    config AUDIO_EQ
+        bool
+        default y if SOFTWARE_EQ || SOFTWARE_EQ_AB
+
+    config I2S_32BIT_OUTPUT
+        bool "Send 32-bit words over I2S"
+        depends on AUDIO_OUTPUT_I2S && !DAC_TAS58XX && !DAC_TAS57XX
+        default n
+        help
+            Send each sample as a 32-bit word (64 bit clocks per frame)
+            instead of a 16-bit one. The software EQ then hands its output
+            over unrounded, the software volume is applied at full precision,
+            and the only rounding left is into the 32-bit word. With 16-bit
+            words both are cut back to 16 bits, whose noise floor sits above
+            that of a good DAC or amplifier: the MAX98357A's is specified
+            with 24- or 32-bit data.
+
+            The DAC must accept 32-bit I2S frames. The MAX98357A picks the
+            word length from the bit clock by itself; a DAC set up over I2C
+            needs its driver to agree. Costs about 12 KB more internal RAM,
+            16 KB with the software EQ: the DMA ring doubles, and the words
+            need buffers of their own.
 
     choice OUTPUT_SAMPLE_RATE
         prompt "Output sample rate"
@@ -309,13 +374,9 @@ menu "Airplay ESP Configuration"
         depends on USB_AUDIO_SINK
         default "ESP32 Audio Device"
         help
-            Name the host shows in its sound output list. Also used for the
-            audio interface, which is what Windows Device Manager displays.
-
-    config USB_AUDIO_SINK_SERIAL
-        string "USB serial number string"
-        depends on USB_AUDIO_SINK
-        default "12345678"
+            Name the host shows in its sound output list until the firmware
+            replaces it with the device name set in the web UI, which it does
+            at startup.
 
     endmenu
 
@@ -384,8 +445,8 @@ menu "Airplay ESP Configuration"
 
             choice DISPLAY_BUS
                 prompt "Display bus"
+                default DISPLAY_BUS_SPI if DISPLAY_DRIVER_ST7789
                 default DISPLAY_BUS_I2C
-                depends on !DISPLAY_DRIVER_ST7789
                 help
                     Select the communication bus for the display.
 
@@ -499,6 +560,17 @@ menu "Airplay ESP Configuration"
                 range 100 5000
                 help
                     How often the display redraws in milliseconds.
+
+            config DISPLAY_BLANK_TIMEOUT_MS
+                int "Screen blank timeout while disconnected (ms, 0 to disable)"
+                default 120000
+                range 0 3600000
+                depends on !DISPLAY_DRIVER_ST7789
+                help
+                    Put the OLED panel into power-save mode after this long
+                    with no AirPlay/Bluetooth/USB connection. It wakes again
+                    as soon as a source connects. Set to 0 to keep the
+                    "AirPlay Ready" screen on indefinitely.
         endif
     endmenu
 
@@ -594,5 +666,107 @@ menu "Airplay ESP Configuration"
                 When enabled, a single play/pause press is deferred until the
                 double-click window expires. Two presses within that window
                 cycle the audio channel mode instead of play/pause.
+
+        config BTN_ROTARY_A_GPIO
+            int "Rotary encoder channel A GPIO (-1 to disable)"
+            default -1
+            range -1 48
+            help
+                GPIO pin for channel A of a quadrature rotary encoder
+                (active-low, internal pull-up, common pin to GND). Turning the
+                encoder clockwise raises the volume, anti-clockwise lowers it.
+                Both channel A and channel B must be set for the encoder to be
+                enabled. Set to -1 to disable.
+
+        config BTN_ROTARY_B_GPIO
+            int "Rotary encoder channel B GPIO (-1 to disable)"
+            default -1
+            range -1 48
+            help
+                GPIO pin for channel B of a quadrature rotary encoder
+                (active-low, internal pull-up, common pin to GND).
+                Set to -1 to disable.
+    endmenu
+
+    menu "Sendspin"
+        config SENDSPIN_ENABLE
+            bool "Build the Sendspin player role (experimental)"
+            default y
+            depends on SPIRAM
+            select HTTPD_WS_POST_HANDSHAKE_CB_SUPPORT
+            help
+                Build the Sendspin "player@v1" client, which presents the
+                device to a Sendspin server on the web server's WebSocket
+                endpoint and advertises _sendspin._tcp.
+
+                This only decides whether the code is present. It stays
+                switched off until it is turned on per device from the web
+                UI, and nothing is allocated until then, so leaving it on
+                costs about 73 KB of flash and no RAM.
+
+                Experimental: PCM, FLAC and (where the SoC can keep up) Opus
+                are decoded, and pairing is by static PIN or pairing PSK. It
+                shares the I2S output with AirPlay and Bluetooth, so only one
+                of the three can play at a time.
+
+                Turn off on a board whose app partition cannot spare the
+                flash. Needs SPIRAM for its own playout timeline.
+
+        config SENDSPIN_OPUS
+            bool "Offer Opus as well as FLAC and PCM"
+            depends on SENDSPIN_ENABLE
+            default y if IDF_TARGET_ESP32S3 || IDF_TARGET_ESP32P4
+            default n
+            help
+                Advertise Opus at 48 kHz, which is the only rate the
+                reference encoder allows.
+
+                Off by default on the original ESP32, where it does not
+                work: the decoder's ~26 KB of state lands in PSRAM, so a
+                20 ms stereo packet takes ~7.7 ms to decode with peaks past
+                realtime. That starves the task decoding it and the audio
+                breaks up. FLAC already halves the bandwidth there.
+
+                Costs 8 KB more stack on the web server task, because
+                libopus keeps its CELT scratch on the stack.
+
+        config SENDSPIN_TIMELINE_BLOCKS
+            int "Playout timeline depth (blocks of 512 frames)"
+            default 1024 if SENDSPIN_OPUS
+            default 192
+            range 32 2048
+            depends on SENDSPIN_ENABLE
+            help
+                Each block holds 512 stereo frames (~11.6 ms at 44.1 kHz) and
+                costs 2 KB of PSRAM. 192 blocks is ~2.2 s of audio for
+                384 KB, which is well past what a LAN sender needs for PCM
+                or FLAC.
+
+                An Opus build needs far more, because the server meters what
+                it may queue in bytes: the same budget buys roughly ten times
+                the duration once Opus is on the wire. Anything arriving
+                beyond the end of the window is rejected, and comes back
+                later as a hole to conceal.
+
+        config SENDSPIN_RX_BUFFER_SIZE
+            int "WebSocket receive buffer (bytes)"
+            default 32768
+            range 8192 131072
+            depends on SENDSPIN_ENABLE
+            help
+                Largest binary message accepted from the server, allocated
+                once in PSRAM. A 150 ms chunk of 44.1 kHz 16-bit stereo PCM is
+                about 26 KB, which is the protocol's worst case for this
+                milestone.
+
+        config SENDSPIN_TIME_SYNC_INTERVAL_MS
+            int "Clock sync interval (ms)"
+            default 2000
+            range 200 30000
+            depends on SENDSPIN_ENABLE
+            help
+                Steady-state interval between client/time requests. The
+                initial burst runs much faster than this so the filter
+                converges before the client reports itself available.
     endmenu
 endmenu

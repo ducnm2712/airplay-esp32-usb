@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 airplay-esp32 contributors
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 #pragma once
 
 #include "esp_err.h"
@@ -16,9 +19,9 @@
 esp_err_t settings_init(void);
 
 /**
- * Get saved volume in dB
+ * Get saved volume in dB, falling back to the built-in default
  * @param volume_db Output: volume in dB (0 = max, -30 = mute)
- * @return ESP_OK if found, ESP_ERR_NOT_FOUND if no saved value
+ * @return ESP_OK unless volume_db is NULL
  */
 esp_err_t settings_get_volume(float *volume_db);
 
@@ -30,7 +33,10 @@ esp_err_t settings_set_volume(float volume_db);
 
 /**
  * Persist the current cached volume to NVS.
- * Call once at session disconnect rather than on every change.
+ *
+ * Call at a pause or at the end of a session, not on every change: a volume
+ * ramp is dozens of distinct levels and each one would be a flash write.
+ * Does nothing if the level has not moved since the last persist.
  */
 esp_err_t settings_persist_volume(void);
 
@@ -146,6 +152,31 @@ bool settings_airplay_v1_configured(void);
  */
 esp_err_t settings_set_airplay_v1(bool v1);
 
+#ifdef CONFIG_SENDSPIN_ENABLE
+// ---- Sendspin ----
+
+/**
+ * Whether the Sendspin player role was started this boot.
+ *
+ * Fixed at settings_init() for the same reason as settings_airplay_v1(): the
+ * WebSocket endpoint, the mDNS record and the playout timeline are all built
+ * once at startup, and the timeline is most of a megabyte that a disabled
+ * board should not be paying for. Defaults to off.
+ */
+bool settings_sendspin_enabled(void);
+
+/**
+ * The Sendspin setting held in storage, which takes effect on the next boot.
+ * Differs from settings_sendspin_enabled() only after a change.
+ */
+bool settings_sendspin_enabled_configured(void);
+
+/**
+ * Save whether to run the Sendspin player role. Takes effect on restart.
+ */
+esp_err_t settings_set_sendspin_enabled(bool enabled);
+#endif
+
 // ---- LED settings ----
 
 /**
@@ -188,6 +219,7 @@ esp_err_t settings_get_sub_offset(float *offset_db);
 esp_err_t settings_set_sub_offset(float offset_db);
 
 // ---- Per-output level and mute (dual-DAC boards) ----
+// The software EQ keeps its two output trims and mutes in A0 and B0.
 
 /** Amplifiers whose outputs can be levelled against each other. */
 #define SETTINGS_AMPS 2
@@ -226,6 +258,17 @@ esp_err_t settings_get_amp_mix(uint8_t mix[SETTINGS_AMPS]);
  */
 esp_err_t settings_set_amp_mix(const uint8_t mix[SETTINGS_AMPS]);
 
+// ---- Per-output delay (audio_delay.h) ----
+
+#define SETTINGS_DELAY_OUTPUTS 2
+
+/** Get the saved per-output delays in microseconds. */
+esp_err_t settings_get_output_delay_us(uint16_t us[SETTINGS_DELAY_OUTPUTS]);
+
+/** Save the per-output delays in microseconds. */
+esp_err_t
+settings_set_output_delay_us(const uint16_t us[SETTINGS_DELAY_OUTPUTS]);
+
 // ---- Per-channel level trim (TAS57xx) ----
 
 /** The two amplifier output channels, A and B. */
@@ -242,6 +285,20 @@ esp_err_t settings_get_channel_trim(float trim_db[SETTINGS_CHANNELS]);
  */
 esp_err_t settings_set_channel_trim(const float trim_db[SETTINGS_CHANNELS]);
 
+// ---- Primary amplifier wiring ----
+
+/**
+ * Get whether the primary amplifier is bridged (PBTL) mono.
+ * @param pbtl Output: true = bridged mono, false = stereo pair
+ * @return ESP_OK if found, error otherwise
+ */
+esp_err_t settings_get_first_pbtl(bool *pbtl);
+
+/**
+ * Save whether the primary amplifier is bridged (PBTL) mono.
+ */
+esp_err_t settings_set_first_pbtl(bool pbtl);
+
 // ---- Dual DAC (second amplifier) wiring ----
 
 /**
@@ -255,3 +312,60 @@ esp_err_t settings_get_second_pbtl(bool *pbtl);
  * Save whether the second amplifier is bridged (PBTL) mono.
  */
 esp_err_t settings_set_second_pbtl(bool pbtl);
+
+// ---- Digital gain ----
+
+/**
+ * Get the digital gain AirPlay's full volume maps to, in dB.
+ * @return ESP_OK if one is stored
+ */
+esp_err_t settings_get_full_volume_db(float *db);
+
+/** Save the digital gain in dB (-60..0, kept to 0.5 dB). */
+esp_err_t settings_set_full_volume_db(float db);
+
+/**
+ * Get the amplifier's analog gain in dB.
+ * @return ESP_OK if one is stored
+ */
+esp_err_t settings_get_analog_gain_db(float *db);
+
+/** Save the analog gain in dB (-15.5..0, kept to 0.5 dB). */
+esp_err_t settings_set_analog_gain_db(float db);
+
+// ---- USB-PD supply ----
+
+/**
+ * Get the voltage to ask a USB-PD charger for.
+ * @param volts Output: one of 5, 9, 12, 15 or 20
+ * @return ESP_OK if found, error otherwise
+ */
+esp_err_t settings_get_usb_pd_volts(int *volts);
+
+/**
+ * Save the voltage to ask a USB-PD charger for.
+ */
+esp_err_t settings_set_usb_pd_volts(int volts);
+
+/**
+ * Whether the board asks the charger for the highest voltage it offers
+ * rather than the one saved with settings_set_usb_pd_volts(). On until
+ * turned off, unless a voltage was saved before this choice existed.
+ */
+bool settings_get_usb_pd_auto(void);
+esp_err_t settings_set_usb_pd_auto(bool on);
+
+/**
+ * Whether the analog gain matches the supply rather than the one saved with
+ * settings_set_analog_gain_db(). On until turned off, unless a gain was
+ * saved before this choice existed.
+ */
+bool settings_get_analog_auto(void);
+esp_err_t settings_set_analog_auto(bool on);
+
+/**
+ * Whether a TAS58xx board plays its EQ on the ESP32 rather than the
+ * amplifier's DSP (CONFIG_SOFTWARE_EQ_AB). Off until turned on.
+ */
+bool settings_get_software_eq_ab(void);
+esp_err_t settings_set_software_eq_ab(bool on);

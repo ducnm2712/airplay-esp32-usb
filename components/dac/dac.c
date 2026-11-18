@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 airplay-esp32 contributors
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 /**
  * DAC dispatch layer
  *
@@ -32,6 +35,12 @@ void dac_set_volume(float volume_db) {
 void dac_set_power_mode(dac_power_mode_t mode) {
   if (s_ops && s_ops->set_power_mode) {
     s_ops->set_power_mode(mode);
+  }
+}
+
+void dac_on_i2s_stopping(void) {
+  if (s_ops && s_ops->on_i2s_stopping) {
+    s_ops->on_i2s_stopping();
   }
 }
 

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 airplay-esp32 contributors
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 /**
  * PurePath Console 3 biquad filter models.
  *
@@ -22,6 +25,13 @@
 
 /* Below this the shelves degenerate to 0/0, so treat them as unity. */
 #define BQ_GAIN_EPSILON_DB 1e-4
+
+/* One past the largest magnitude a 5.27 coefficient holds. */
+#define BQ_COEFF_LIMIT 16.0
+
+/* Every rate a chain is designed for: the I2S rates a TAS5825M runs its
+ * sections at, and the two a TAS5805M's converter takes them to. */
+static const double bq_rates[] = {44100.0, 48000.0, 88200.0, 96000.0};
 
 typedef struct {
   double b0, b1, b2, a1, a2; /* a1/a2 negated, i.e. device convention */
@@ -347,13 +357,31 @@ static bq_coeff_t bq_phase_shift(double freq, double bw, double fs) {
   return o;
 }
 
+static void bq_store(bq_coeff_t o, double out[5]) {
+  out[0] = o.b0;
+  out[1] = o.b1;
+  out[2] = o.b2;
+  out[3] = o.a1;
+  out[4] = o.a2;
+}
+
 /* ---------------- public entry points ---------------- */
+
+double tas5805m_dsp_rate(double i2s_rate_hz) {
+  const long hz = lround(i2s_rate_hz);
+  return (hz > 0 && hz % 11025 == 0) ? 88200.0 : 96000.0;
+}
 
 void tas58xx_bq_design(const tas58xx_bq_t *bq, double sample_rate_hz,
                        double out[5]) {
   bq_coeff_t o = bq_unity;
 
-  if (!bq || !out) {
+  if (!out) {
+    return;
+  }
+  /* Callers pack out[] unconditionally: design unity. */
+  if (!bq) {
+    bq_store(o, out);
     return;
   }
   const double fs = (sample_rate_hz > 1000.0) ? sample_rate_hz : 48000.0;
@@ -423,11 +451,47 @@ void tas58xx_bq_design(const tas58xx_bq_t *bq, double sample_rate_hz,
     o.b2 = -o.b2;
   }
 
-  out[0] = o.b0;
-  out[1] = o.b1;
-  out[2] = o.b2;
-  out[3] = o.a1;
-  out[4] = o.a2;
+  bq_store(o, out);
+}
+
+/* Whether every coefficient fits the part's 5.27 words, which hold -16 up to
+ * just under +16. */
+static bool bq_fits(const double c[5]) {
+  for (int i = 0; i < 5; i++) {
+    if (!(fabs(c[i]) < BQ_COEFF_LIMIT)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool tas58xx_bq_fits(const tas58xx_bq_t *bq) {
+  if (!bq) {
+    return false;
+  }
+  for (size_t i = 0; i < sizeof(bq_rates) / sizeof(bq_rates[0]); i++) {
+    double c[5];
+    tas58xx_bq_design(bq, bq_rates[i], c);
+    if (!bq_fits(c)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+void tas58xx_bq_design_chip(const tas58xx_bq_t *bq, double sample_rate_hz,
+                            double out[5]) {
+  if (!out) {
+    return;
+  }
+  /* Callers pack out[] unconditionally; a null bq designs unity. */
+  tas58xx_bq_design(bq, sample_rate_hz, out);
+  /* Packed, these would saturate and leave the chain running a different
+   * filter altogether. */
+  if (bq && !bq_fits(out)) {
+    out[0] = bq->invert ? -1.0 : 1.0;
+    out[1] = out[2] = out[3] = out[4] = 0.0;
+  }
 }
 
 void tas58xx_bq_pack(const double coeff[5],
@@ -480,8 +544,107 @@ void tas58xx_bq_unpack(const uint8_t in[TAS58XX_BQ_COEFF_BYTES],
 void tas58xx_bq_design_packed(const tas58xx_bq_t *bq, double sample_rate_hz,
                               uint8_t out[TAS58XX_BQ_COEFF_BYTES]) {
   double coeff[5];
-  tas58xx_bq_design(bq, sample_rate_hz, coeff);
+  tas58xx_bq_design_chip(bq, sample_rate_hz, coeff);
   tas58xx_bq_pack(coeff, out);
+}
+
+/*
+ * |b0 + b1 z^-1 + b2 z^-2|^2 on the unit circle, written in phi =
+ * 4 sin^2(w/2): s^2 + (c0 c2 phi - (c1 (c0 + c2) + 4 c0 c2)) phi, with
+ * s = c0 + c1 + c2. Unlike the cos w form it does not cancel at low
+ * frequencies, where a corner near DC leaves s tiny.
+ */
+typedef struct {
+  float s2, k1, k2;
+} bq_poly_t;
+
+static bq_poly_t bq_poly(double c0, double c1, double c2) {
+  const double s = c0 + c1 + c2;
+  return (bq_poly_t){.s2 = (float)(s * s),
+                     .k1 = (float)(-(c1 * (c0 + c2) + 4.0 * c0 * c2)),
+                     .k2 = (float)(c0 * c2)};
+}
+
+static float bq_poly_at(const bq_poly_t *p, float phi) {
+  return p->s2 + (p->k2 * phi + p->k1) * phi;
+}
+
+/* |H|^2 of the whole chain at one frequency. */
+static float chain_power(const bq_poly_t (*polys)[2], int count, float fs,
+                         float f) {
+  const float s = sinf((float)M_PI * f / fs);
+  const float phi = 4.0f * s * s;
+  float power = 1.0f;
+  for (int i = 0; i < count; i++) {
+    const float den = bq_poly_at(&polys[i][1], phi);
+    if (!(den > 1e-30f)) {
+      return 0.0f;
+    }
+    power *= bq_poly_at(&polys[i][0], phi) / den;
+  }
+  return power;
+}
+
+float tas58xx_bq_chain_peak_db(const double (*coeff)[5], int count,
+                               double sample_rate_hz, float *at_hz) {
+  bq_poly_t polys[TAS58XX_BQ_SLOTS][2];
+  if (count > TAS58XX_BQ_SLOTS) {
+    count = TAS58XX_BQ_SLOTS;
+  }
+  for (int i = 0; i < count; i++) {
+    polys[i][0] = bq_poly(coeff[i][0], coeff[i][1], coeff[i][2]);
+    /* a1 and a2 are stored negated: the denominator is 1 - a1 - a2. */
+    polys[i][1] = bq_poly(1.0, -coeff[i][3], -coeff[i][4]);
+  }
+
+  /* A 1/48-octave sweep finds every peak, and a golden-section search
+   * between each local maximum's neighbours finds its top: a Q 20 peak is
+   * only about three steps wide. */
+  const float fs = (float)sample_rate_hz;
+  const float top = fminf(20000.0f, fs * 0.45f);
+  const float step = powf(2.0f, 1.0f / 48.0f);
+  const float golden = 0.618034f;
+  float best = 0.0f, best_f = 10.0f;
+  float prev = 0.0f, cur = chain_power(polys, count, fs, 10.0f);
+  float f = 10.0f;
+  while (f <= top) {
+    const float next =
+        f * step <= top ? chain_power(polys, count, fs, f * step) : 0.0f;
+    if (cur > best) {
+      best = cur;
+      best_f = f;
+    }
+    if (cur > prev && cur >= next) {
+      float lo = f / step, hi = fminf(f * step, top);
+      for (int it = 0; it < 24; it++) {
+        const float m1 = hi - golden * (hi - lo);
+        const float m2 = lo + golden * (hi - lo);
+        const float p1 = chain_power(polys, count, fs, m1);
+        const float p2 = chain_power(polys, count, fs, m2);
+        if (p1 > best) {
+          best = p1;
+          best_f = m1;
+        }
+        if (p2 > best) {
+          best = p2;
+          best_f = m2;
+        }
+        if (p1 > p2) {
+          hi = m2;
+        } else {
+          lo = m1;
+        }
+      }
+    }
+    prev = cur;
+    cur = next;
+    f *= step;
+  }
+
+  if (at_hz) {
+    *at_hz = best_f;
+  }
+  return best > 0.0f ? 10.0f * log10f(best) : -120.0f;
 }
 
 bool tas58xx_bq_validate(const tas58xx_bq_t *bq, const char **why) {

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 airplay-esp32 contributors
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 /**
  * HybridFlow 3 (bi-amp) parameter map for the TAS5754M.
  *
@@ -157,7 +160,7 @@ esp_err_t tas57xx_hf3_set_drc_split(const tas57xx_cram_sink_t *sink,
                                     const tas57xx_bq_t *high,
                                     uint32_t sample_rate_hz);
 
-#define TAS57XX_HF3_DRC_MIX_MIN -1.0f
+#define TAS57XX_HF3_DRC_MIX_MIN (-1.0f)
 #define TAS57XX_HF3_DRC_MIX_MAX 1.0f
 
 /**

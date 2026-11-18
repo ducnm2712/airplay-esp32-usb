@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 airplay-esp32 contributors
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 /**
  * Bluetooth A2DP Sink implementation for ESP32.
  *
@@ -10,8 +13,8 @@
  * Integration with AirPlay:
  *   - On BT connect:    notify main → stop AirPlay services
  *   - On BT disconnect: notify main → restart AirPlay services
- *   - LED/display updates via rtsp_events (reuses the same event types)
- *   - AVRCP metadata → RTSP_EVENT_METADATA for display
+ *   - LED/display updates via playback_events (reuses the same event types)
+ *   - AVRCP metadata → PLAYBACK_EVENT_METADATA for display
  */
 
 #include "a2dp_sink.h"
@@ -19,8 +22,7 @@
 
 #include "audio_output.h"
 #include "dac.h"
-#include "led.h"
-#include "rtsp_events.h"
+#include "playback_events.h"
 #include "settings.h"
 
 #include "esp_a2dp_api.h"
@@ -39,6 +41,8 @@
 #include "freertos/task.h"
 
 #include <inttypes.h>
+#include <math.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -106,6 +110,10 @@ static bool s_bt_suspended = false;
 // Advertised BT device name, saved so it can be re-applied after a resume.
 static char s_device_name[64] = {0};
 static uint8_t s_avrc_volume = 64; /* 0-127, AVRCP absolute volume */
+// The same volume as a software gain, for DACs that cannot attenuate
+// themselves (audio_output_write_pcm ignores it on those that can). Set on
+// the BT app task, read by the I2S writer.
+static _Atomic int32_t s_volume_q15 = 32768;
 static volatile bool s_vol_ntf_pending =
     false; /* phone registered for volume change */
 
@@ -172,18 +180,22 @@ static void bt_i2s_writer_task(void *arg) {
   // Wait for ringbuffer to reach prefetch level
   xSemaphoreTake(s_i2s_sem, portMAX_DELAY);
 
-  int16_t silence[256] = {0};
+  static const int16_t silence[256] = {0};
 
   while (s_i2s_task_running) {
     size_t item_size = 0;
     void *data =
         xRingbufferReceiveUpTo(s_ringbuf, &item_size, pdMS_TO_TICKS(20), 512);
+    // Through the same processing as AirPlay: channel mode, software EQ and
+    // software volume.
+    int32_t volume_q15 = atomic_load(&s_volume_q15);
     if (data != NULL && item_size > 0) {
-      audio_output_write(data, item_size, portMAX_DELAY);
+      audio_output_write_pcm(data, item_size, volume_q15, portMAX_DELAY);
       vRingbufferReturnItem(s_ringbuf, data);
     } else {
       // Buffer underrun — write silence to keep I2S fed
-      audio_output_write(silence, sizeof(silence), pdMS_TO_TICKS(10));
+      audio_output_write_pcm(silence, sizeof(silence), volume_q15,
+                             pdMS_TO_TICKS(10));
     }
   }
 
@@ -257,9 +269,6 @@ static void bt_a2dp_data_cb(const uint8_t *data, uint32_t len) {
     return;
   }
 
-  // Feed LED VU meter from the decoded PCM
-  led_audio_feed((const int16_t *)data, len / 4);
-
   size_t free_size = xRingbufferGetCurFreeSize(rb);
 
   switch (s_ringbuf_mode) {
@@ -315,7 +324,8 @@ static void bt_a2dp_evt_handler(uint16_t event, void *param) {
       i2s_task_start();
 
       // LED/display: show connected state
-      rtsp_events_emit(RTSP_EVENT_CLIENT_CONNECTED, NULL);
+      playback_events_emit(PLAYBACK_SOURCE_BLUETOOTH, PLAYBACK_EVENT_CONNECTED,
+                           NULL);
 
       // Don't accept more connections while connected
       esp_bt_gap_set_scan_mode(ESP_BT_NON_CONNECTABLE, ESP_BT_NON_DISCOVERABLE);
@@ -332,7 +342,8 @@ static void bt_a2dp_evt_handler(uint16_t event, void *param) {
       i2s_task_stop();
 
       // LED/display: show disconnected state
-      rtsp_events_emit(RTSP_EVENT_DISCONNECTED, NULL);
+      playback_events_emit(PLAYBACK_SOURCE_BLUETOOTH,
+                           PLAYBACK_EVENT_DISCONNECTED, NULL);
 
       // Notify main app to re-enable AirPlay (restarts playback + RTSP)
       if (s_state_cb) {
@@ -352,11 +363,13 @@ static void bt_a2dp_evt_handler(uint16_t event, void *param) {
     if (state == ESP_A2D_AUDIO_STATE_STARTED) {
       ESP_LOGI(TAG, "Audio stream started");
       s_audio_started = true;
-      rtsp_events_emit(RTSP_EVENT_PLAYING, NULL);
+      playback_events_emit(PLAYBACK_SOURCE_BLUETOOTH, PLAYBACK_EVENT_PLAYING,
+                           NULL);
     } else {
       ESP_LOGI(TAG, "Audio stream stopped/suspended");
       s_audio_started = false;
-      rtsp_events_emit(RTSP_EVENT_PAUSED, NULL);
+      playback_events_emit(PLAYBACK_SOURCE_BLUETOOTH, PLAYBACK_EVENT_PAUSED,
+                           NULL);
     }
     break;
   }
@@ -405,7 +418,7 @@ static void bt_a2dp_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param) {
 
 static void bt_avrc_ct_evt_handler(uint16_t event, void *param) {
   esp_avrc_ct_cb_param_t *rc = (esp_avrc_ct_cb_param_t *)param;
-  static rtsp_event_data_t meta_data;
+  static playback_event_data_t meta_data;
 
   switch (event) {
   case ESP_AVRC_CT_CONNECTION_STATE_EVT:
@@ -473,7 +486,8 @@ static void bt_avrc_ct_evt_handler(uint16_t event, void *param) {
       ESP_LOGI(TAG, "Metadata attr %d: %s", attr_id, dst);
 
       // Emit metadata event after each attribute update
-      rtsp_events_emit(RTSP_EVENT_METADATA, &meta_data);
+      playback_events_emit(PLAYBACK_SOURCE_BLUETOOTH, PLAYBACK_EVENT_METADATA,
+                           &meta_data);
     }
     free(text);
     break;
@@ -495,16 +509,19 @@ static void bt_avrc_ct_evt_handler(uint16_t event, void *param) {
     if (position_ms != 0xFFFFFFFF) {
       meta_data.metadata.position_secs = position_ms / 1000;
     }
-    rtsp_events_emit(RTSP_EVENT_METADATA, &meta_data);
+    playback_events_emit(PLAYBACK_SOURCE_BLUETOOTH, PLAYBACK_EVENT_METADATA,
+                         &meta_data);
 
     // Emit play state from AVRCP (faster than A2D audio state)
     if (status == ESP_AVRC_PLAYBACK_PLAYING) {
       s_avrc_playing = true;
-      rtsp_events_emit(RTSP_EVENT_PLAYING, NULL);
+      playback_events_emit(PLAYBACK_SOURCE_BLUETOOTH, PLAYBACK_EVENT_PLAYING,
+                           NULL);
     } else if (status == ESP_AVRC_PLAYBACK_PAUSED ||
                status == ESP_AVRC_PLAYBACK_STOPPED) {
       s_avrc_playing = false;
-      rtsp_events_emit(RTSP_EVENT_PAUSED, NULL);
+      playback_events_emit(PLAYBACK_SOURCE_BLUETOOTH, PLAYBACK_EVENT_PAUSED,
+                           NULL);
     }
     break;
   }
@@ -532,11 +549,13 @@ static void bt_avrc_ct_evt_handler(uint16_t event, void *param) {
 
       if (status == ESP_AVRC_PLAYBACK_PLAYING) {
         s_avrc_playing = true;
-        rtsp_events_emit(RTSP_EVENT_PLAYING, NULL);
+        playback_events_emit(PLAYBACK_SOURCE_BLUETOOTH, PLAYBACK_EVENT_PLAYING,
+                             NULL);
       } else if (status == ESP_AVRC_PLAYBACK_PAUSED ||
                  status == ESP_AVRC_PLAYBACK_STOPPED) {
         s_avrc_playing = false;
-        rtsp_events_emit(RTSP_EVENT_PAUSED, NULL);
+        playback_events_emit(PLAYBACK_SOURCE_BLUETOOTH, PLAYBACK_EVENT_PAUSED,
+                             NULL);
       }
       // Re-register
       esp_avrc_ct_send_register_notification_cmd(
@@ -547,7 +566,8 @@ static void bt_avrc_ct_evt_handler(uint16_t event, void *param) {
 
       if (pos_ms != 0xFFFFFFFF) {
         meta_data.metadata.position_secs = pos_ms / 1000;
-        rtsp_events_emit(RTSP_EVENT_METADATA, &meta_data);
+        playback_events_emit(PLAYBACK_SOURCE_BLUETOOTH, PLAYBACK_EVENT_METADATA,
+                             &meta_data);
       }
       // Re-register
       esp_avrc_ct_send_register_notification_cmd(
@@ -587,13 +607,29 @@ static void bt_avrc_ct_cb(esp_avrc_ct_cb_event_t event,
     local.meta_rsp.attr_text = copy;
   }
 
-  bt_app_work_dispatch(bt_avrc_ct_evt_handler, (uint16_t)event, &local,
-                       sizeof(esp_avrc_ct_cb_param_t));
+  // Not dispatched: the copy is still ours.
+  if (!bt_app_work_dispatch(bt_avrc_ct_evt_handler, (uint16_t)event, &local,
+                            sizeof(esp_avrc_ct_cb_param_t)) &&
+      event == ESP_AVRC_CT_METADATA_RSP_EVT) {
+    free(local.meta_rsp.attr_text);
+  }
 }
 
 /* ========================================================================== */
 /* AVRCP Target — handle volume commands from source device                   */
 /* ========================================================================== */
+
+// Apply an AVRCP volume (0-127, mapped to -30..0 dB) to the DAC and to the
+// software gain, and return it in dB. As on USB, the bottom of the phone's
+// slider is silence in software rather than just -30 dB.
+static float bt_apply_volume(uint8_t volume) {
+  float volume_db = ((float)volume / 127.0f) * 30.0f - 30.0f;
+  dac_set_volume(volume_db);
+  atomic_store(
+      &s_volume_q15,
+      volume == 0 ? 0 : (int32_t)(32768.0f * powf(10.0f, volume_db / 20.0f)));
+  return volume_db;
+}
 
 static void bt_avrc_tg_evt_handler(uint16_t event, void *param) {
   esp_avrc_tg_cb_param_t *tg = (esp_avrc_tg_cb_param_t *)param;
@@ -609,11 +645,9 @@ static void bt_avrc_tg_evt_handler(uint16_t event, void *param) {
     s_avrc_volume = volume;
     ESP_LOGD(TAG, "Set absolute volume: %d/127", volume);
 
-    // Map 0-127 → -30..0 dB and apply to DAC
     // dac_set_volume does I2C — safe here because bt_app_task dispatches
     // sequentially, but keep it lightweight
-    float volume_db = ((float)volume / 127.0f) * 30.0f - 30.0f;
-    dac_set_volume(volume_db);
+    bt_apply_volume(volume);
     break;
   }
 
@@ -713,6 +747,8 @@ static void bt_register_profiles(void) {
   if (pin_len > ESP_BT_PIN_CODE_LEN) {
     pin_len = ESP_BT_PIN_CODE_LEN;
   }
+  // Length-delimited, not a C string.
+  // NOLINTNEXTLINE(bugprone-not-null-terminated-result)
   memcpy(pin_code, pin_str, pin_len);
   esp_bt_gap_set_pin(pin_type, pin_len, pin_code);
   ESP_LOGI(TAG, "BT PIN set (%d digits)", pin_len);
@@ -763,8 +799,7 @@ static void bt_restore_saved_volume(void) {
   if (settings_get_bt_volume(&saved_vol) == ESP_OK) {
     s_avrc_volume = saved_vol;
   }
-  float volume_db = ((float)s_avrc_volume / 127.0f) * 30.0f - 30.0f;
-  dac_set_volume(volume_db);
+  float volume_db = bt_apply_volume(s_avrc_volume);
   ESP_LOGI(TAG, "BT volume restored: %d/127 (%.1f dB)", s_avrc_volume,
            volume_db);
 }
@@ -1136,8 +1171,7 @@ void bt_a2dp_send_volume_up(void) {
     new_vol = 127;
   }
   s_avrc_volume = new_vol;
-  float volume_db = ((float)new_vol / 127.0f) * 30.0f - 30.0f;
-  dac_set_volume(volume_db);
+  bt_apply_volume(new_vol);
   notify_volume_changed();
   ESP_LOGI(TAG, "AVRCP: volume up -> %d/127", new_vol);
 }
@@ -1150,8 +1184,7 @@ void bt_a2dp_send_volume_down(void) {
     new_vol = 0;
   }
   s_avrc_volume = new_vol;
-  float volume_db = ((float)new_vol / 127.0f) * 30.0f - 30.0f;
-  dac_set_volume(volume_db);
+  bt_apply_volume(new_vol);
   notify_volume_changed();
   ESP_LOGI(TAG, "AVRCP: volume down -> %d/127", new_vol);
 }

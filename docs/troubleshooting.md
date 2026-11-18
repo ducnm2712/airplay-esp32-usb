@@ -174,8 +174,8 @@ git submodule update --init --recursive
 
 Clone with `--recursive` to avoid this in the first place.
 
-**Wrong ESP-IDF version.** The project requires **v5.5 or newer** and is tested against
-v5.5.2. Older versions need workarounds.
+**Wrong ESP-IDF version.** The project requires **v6.1 or newer**. If using PlatformIO,
+refresh the platform and matching toolchain pinned in `platformio.ini`.
 
 ### Changes to sdkconfig defaults have no effect
 
@@ -189,9 +189,8 @@ pio run -e <env> -t build
 
 ### PlatformIO cannot find a platform for my chip
 
-The official `platformio/espressif32` platform does not support the ESP32-C5. The
-`esp32c5-xiao` environment pins the community pioarduino platform instead — see
-[Seeed XIAO ESP32-C5](boards/xiao-esp32c5.md).
+The selected PlatformIO platform and matching toolchain are pinned in `platformio.ini`
+and installed automatically on the first build. See [Seeed XIAO ESP32-C5](boards/xiao-esp32c5.md).
 
 ## Still stuck?
 

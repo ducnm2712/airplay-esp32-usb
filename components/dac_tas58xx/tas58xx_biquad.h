@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 airplay-esp32 contributors
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 #pragma once
 
 /**
@@ -72,6 +75,16 @@ typedef struct {
 void tas58xx_bq_init_bypass(tas58xx_bq_t *bq);
 
 /**
+ * The rate a TAS5805M's biquads run at, for audio arriving at @p i2s_rate_hz.
+ *
+ * Its ROM process flow puts a sample-rate converter ahead of the EQ, which
+ * takes every input to 96 kHz, or to 88.2 kHz for the 44.1 kHz family (TI
+ * SLOA263A, Process Flow 1). A section designed at the I2S rate therefore
+ * plays an octave high at 48 kHz, so the part's sections are designed here.
+ */
+double tas5805m_dsp_rate(double i2s_rate_hz);
+
+/**
  * Compute the five device coefficients for @p bq at @p sample_rate_hz.
  *
  * @p out receives {b0, b1, b2, -a1, -a2} — the denominator terms are already
@@ -81,6 +94,14 @@ void tas58xx_bq_init_bypass(tas58xx_bq_t *bq);
  */
 void tas58xx_bq_design(const tas58xx_bq_t *bq, double sample_rate_hz,
                        double out[5]);
+
+/**
+ * tas58xx_bq_design() for the part: a section whose coefficients would not
+ * fit its 5.27 words comes out as a pass-through, keeping only its polarity,
+ * since saturated it would play a different filter altogether.
+ */
+void tas58xx_bq_design_chip(const tas58xx_bq_t *bq, double sample_rate_hz,
+                            double out[5]);
 
 /**
  * Pack designed coefficients into the part's 5.27 big-endian layout.
@@ -98,9 +119,32 @@ void tas58xx_bq_pack(const double coeff[5],
 void tas58xx_bq_unpack(const uint8_t in[TAS58XX_BQ_COEFF_BYTES],
                        tas58xx_bq_t *bq);
 
-/** Design and pack in one step. */
+/** tas58xx_bq_design_chip() and pack in one step. */
 void tas58xx_bq_design_packed(const tas58xx_bq_t *bq, double sample_rate_hz,
                               uint8_t out[TAS58XX_BQ_COEFF_BYTES]);
 
+/**
+ * Highest point of a chain's magnitude response, in dB, between 10 Hz and the
+ * lower of 20 kHz and 0.45 of @p sample_rate_hz: how far the chain lifts a
+ * full-scale tone above full scale. @p coeff holds @p count sections already
+ * designed with tas58xx_bq_design() at that rate. @p at_hz, if given,
+ * receives where the peak is. An empty chain is flat, 0 dB.
+ *
+ * Evaluated in single precision, which is cheap enough to run on every edit:
+ * each section's terms are formed in double and only then rounded, so the
+ * low corners that need double precision to design lose nothing here.
+ */
+float tas58xx_bq_chain_peak_db(const double (*coeff)[5], int count,
+                               double sample_rate_hz, float *at_hz);
+
 /** True when @p bq is structurally valid; @p why is optional. */
 bool tas58xx_bq_validate(const tas58xx_bq_t *bq, const char **why);
+
+/**
+ * Whether @p bq's coefficients fit the part's 5.27 words at every rate a
+ * chain is designed for: 44.1 and 48 kHz on a TAS5825M, 88.2 and 96 kHz
+ * behind a TAS5805M's converter. Past 16 a word saturates and the part plays
+ * a different filter altogether; a treble shelf boosted beyond about 18 dB
+ * with its corner below a few kHz is what gets there.
+ */
+bool tas58xx_bq_fits(const tas58xx_bq_t *bq);

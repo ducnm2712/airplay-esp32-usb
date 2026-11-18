@@ -5,6 +5,7 @@ set( SRC_FILES
     "audio/audio_receiver.c"
     "audio/audio_stream.c"
     "audio/audio_stream_realtime.c"
+    "audio/rtp_resend.c"
     "audio/audio_stream_buffered.c"
     "audio/audio_decoder.c"
     "audio/audio_buffer.c"
@@ -24,7 +25,6 @@ set( SRC_FILES
     "rtsp/rtsp_fairplay.c"
     "rtsp/rtsp_crypto.c"
     "rtsp/rtsp_rsa.c"
-    "rtsp/rtsp_events.c"
     "plist/plist_xml.c"
     "plist/bplist_parser.c"
     "plist/bplist_builder.c"
@@ -47,6 +47,7 @@ set( SRC_FILES
     "led.c"
     "buttons.c"
     "playback_control.c"
+    "playback_events.c"
     "dacp_client.c"
 )
 
@@ -62,12 +63,22 @@ elseif(CONFIG_AUDIO_OUTPUT_USB_HOST)
     list(APPEND SRC_FILES "audio/audio_output_usb_host.c")
 else()
     list(APPEND SRC_FILES "audio/audio_output.c")
+    list(APPEND SRC_FILES "audio/audio_delay.c")
 endif()
 
 # Bluetooth A2DP sink (only available on ESP32 with Classic BT)
 if(CONFIG_BT_A2DP_ENABLE)
     list(APPEND SRC_FILES "audio/a2dp_sink.c")
     list(APPEND SRC_FILES "bt_coex.c")
+endif()
+
+# Software parametric EQ for DACs without a DSP (I2S backend only), also
+# lent to a TAS58xx to compare its own EQ against
+if(CONFIG_AUDIO_EQ)
+    list(APPEND SRC_FILES "audio/audio_eq.c")
+endif()
+if(CONFIG_SOFTWARE_EQ_AB)
+    list(APPEND SRC_FILES "audio/eq_ab.c")
 endif()
 
 # USB Audio Class sink (host -> I2S, chips with USB OTG only)
@@ -80,6 +91,16 @@ if(CONFIG_ETH_W5500_ENABLED)
     list(APPEND SRC_FILES "network/ethernet.c")
 endif()
 
+# Sendspin player role (WebSocket + its own playout timeline)
+if(CONFIG_SENDSPIN_ENABLE)
+    list(APPEND SRC_FILES "sendspin/sendspin.c")
+    list(APPEND SRC_FILES "sendspin/sendspin_noise.c")
+    list(APPEND SRC_FILES "sendspin/sendspin_psk.c")
+    list(APPEND SRC_FILES "sendspin/sendspin_cpace.c")
+    list(APPEND SRC_FILES "sendspin/sendspin_time.c")
+    list(APPEND SRC_FILES "sendspin/sendspin_player.c")
+endif()
+
 set( INC_DIRS
     "." 
     "audio" 
@@ -87,11 +108,13 @@ set( INC_DIRS
     "plist" 
     "hap" 
     "network"
+    "sendspin"
     "usb"
 )
 
 set( DEPS
-    driver
+    esp_driver_gpio
+    esp_driver_spi
     nvs_flash
     esp_wifi
     esp_netif
@@ -102,13 +125,15 @@ set( DEPS
     esp_http_server
     esp_http_client
     app_update
-    json
+    cjson
     mbedtls
     esp_driver_ledc
     boards
     dac
     dac_tas58xx
     dac_tas57xx
+    dac_pcm51xx
+    husb238a
     display
     audio-resampler
     esp_eth
