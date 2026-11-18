@@ -138,7 +138,6 @@ set( DEPS
     audio-resampler
     esp_eth
     spiffs_storage
-    usb
 )
 
 # Bluetooth component only needed when A2DP is enabled
