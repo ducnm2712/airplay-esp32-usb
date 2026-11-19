@@ -25,11 +25,19 @@ jobs:
           python -m pip install --upgrade pip
           pip install platformio
 
-      - name: Build ESP32-S3 USB Host
+      - name: Build Firmware
         run: |
           pio run -e esp32s3-usbhost
 
-      - name: Upload firmware artifacts
+      - name: Build SPIFFS
+        run: |
+          pio run -e esp32s3-usbhost -t buildfs
+
+      - name: Show Output Files
+        run: |
+          ls -lah .pio/build/esp32s3-usbhost/
+
+      - name: Upload Artifacts
         uses: actions/upload-artifact@v4
         with:
           name: esp32s3-usbhost
